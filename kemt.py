@@ -2913,30 +2913,50 @@ class MainEnterpriseApp(QMainWindow):
         QMessageBox.information(self, "Export Complete", f"Summary report exported successfully to:\n{path}")
 
     def export_container_manifest_excel(self):
+        client_id = self.combo_rep_client.currentData()
+        client_name = self.combo_rep_client.currentText()
         cnt_id = self.combo_rep_cnt.currentData()
         cnt_num = self.combo_rep_cnt.currentText()
+
+        if not client_id:
+            QMessageBox.warning(self, "Warning", "Please select a client first!")
+            return
         if not cnt_id:
             QMessageBox.warning(self, "Warning", "Please select a container first!")
             return
 
-        default_filename = f"Kemt_Container_{cnt_num}_Manifest.xlsx"
-        path, _ = QFileDialog.getSaveFileName(self, "Export Container Manifest", default_filename, "Excel (*.xlsx)")
+        default_filename = f"Kemt_{client_name}_{cnt_num}_Manifest.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Container Manifest", default_filename, "Excel (*.xlsx)"
+        )
         if not path:
             return
 
         conn = sqlite3.connect("import_enterprise.db")
         c = conn.cursor()
-        c.execute("""
-        SELECT c.container_num, e.name, c.shipping_line, c.bill_of_lading, c.arrival_date, c.status, c.total_container_cost
-        FROM containers c
-        LEFT JOIN entities e ON c.client_id = e.id
-        WHERE c.id = ?
-        """, (cnt_id,))
-        cnt = c.fetchone()
 
         c.execute("""
-        SELECT item_code, item_ar, item_cn, cartons, piece_price, cbm, weight, allocated_expense, landed_cost_unit 
-        FROM container_items WHERE container_id = ?
+        SELECT c.container_num, e.name, c.shipping_line, c.bill_of_lading, c.arrival_date,
+               c.total_container_cost
+        FROM containers c
+        LEFT JOIN entities e ON c.client_id = e.id
+        WHERE c.id = ? AND c.client_id = ?
+        """, (cnt_id, client_id))
+        cnt = c.fetchone()
+
+        if not cnt:
+            conn.close()
+            QMessageBox.warning(self, "Warning", "The selected container does not belong to the selected client.")
+            return
+
+        c.execute("""
+        SELECT ci.source_invoice_num, ci.item_code, ci.item_ar, ci.item_cn,
+               ci.cartons, ci.piece_price,
+               COALESCE(ci.total_cbm, ci.cbm, 0), ci.weight,
+               ci.allocated_expense, ci.landed_cost_unit
+        FROM container_items ci
+        WHERE ci.container_id = ?
+        ORDER BY ci.source_invoice_num, ci.id
         """, (cnt_id,))
         items = c.fetchall()
         conn.close()
@@ -2947,6 +2967,7 @@ class MainEnterpriseApp(QMainWindow):
         ws.sheet_view.rightToLeft = False
 
         header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
+        invoice_fill = PatternFill(start_color="E9ECEF", end_color="E9ECEF", fill_type="solid")
         header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
         bold_font = Font(name="Calibri", size=11, bold=True)
         thin_border = Border(
@@ -2962,33 +2983,55 @@ class MainEnterpriseApp(QMainWindow):
         ws.cell(row=1, column=5, value=cnt[1])
 
         ws.cell(row=2, column=1, value="Shipping Line:").font = bold_font
-        ws.cell(row=2, column=2, value=cnt[2])
+        ws.cell(row=2, column=2, value=cnt[2] or "")
         ws.cell(row=2, column=4, value="B/L Number:").font = bold_font
-        ws.cell(row=2, column=5, value=cnt[3])
+        ws.cell(row=2, column=5, value=cnt[3] or "")
 
         ws.cell(row=3, column=1, value="Arrival Date:").font = bold_font
-        ws.cell(row=3, column=2, value=cnt[4])
-        ws.cell(row=3, column=4, value="Status:").font = bold_font
-        ws.cell(row=3, column=5, value=cnt[5])
+        ws.cell(row=3, column=2, value=cnt[4] or "")
+        ws.cell(row=3, column=4, value="Total Cost (Local):").font = bold_font
+        ws.cell(row=3, column=5, value=f"{cnt[5] or 0:,.2f} EGP").font = bold_font
 
-        ws.cell(row=4, column=1, value="Total Cost (Local):").font = bold_font
-        ws.cell(row=4, column=2, value=f"{cnt[6]:,.2f} EGP").font = bold_font
-
-        headers = ["Item Code", "Name (AR)", "Name (CN)", "Cartons", "Purchase Price", "CBM", "Weight (KG)", "Allocated Exp", "Landed Cost / Unit"]
+        headers = [
+            "Item Code", "Name (AR)", "Name (CN)", "Cartons", "Purchase Price",
+            "CBM", "Weight (KG)", "Allocated Exp", "Landed Cost / Unit"
+        ]
+        header_row = 5
         for col_idx, h in enumerate(headers, start=1):
-            cell = ws.cell(row=6, column=col_idx, value=h)
+            cell = ws.cell(row=header_row, column=col_idx, value=h)
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        for row_idx, itm in enumerate(items, start=7):
-            for col_idx, val in enumerate(itm, start=1):
+        current_invoice = None
+        row_idx = header_row + 1
+
+        for itm in items:
+            invoice_num = itm[0] or "Unknown Invoice"
+
+            if invoice_num != current_invoice:
+                ws.merge_cells(
+                    start_row=row_idx, start_column=1,
+                    end_row=row_idx, end_column=9
+                )
+                invoice_cell = ws.cell(row=row_idx, column=1, value=f"Invoice: {invoice_num}")
+                invoice_cell.fill = invoice_fill
+                invoice_cell.font = bold_font
+                row_idx += 1
+                current_invoice = invoice_num
+
+            values = [
+                itm[1], itm[2], itm[3], itm[4], itm[5],
+                itm[6], itm[7], itm[8], itm[9]
+            ]
+            for col_idx, val in enumerate(values, start=1):
                 cell = ws.cell(row=row_idx, column=col_idx, value=val)
                 cell.border = thin_border
+                if col_idx in [5, 8, 9]:
+                    cell.number_format = "#,##0.00"
                 if col_idx in [4, 5, 6, 7, 8, 9]:
-                    if col_idx in [5, 8, 9]:
-                        cell.number_format = "#,##0.00"
                     cell.alignment = Alignment(horizontal="right", vertical="center")
+            row_idx += 1
 
         for col in ws.columns:
             max_len = max(len(str(cell.value or '')) for cell in col)
@@ -2996,8 +3039,11 @@ class MainEnterpriseApp(QMainWindow):
             ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
 
         wb.save(path)
-        record_log(self.username, "EXPORT_EXCEL", f"Exported Container Manifest: {cnt_num}")
-        QMessageBox.information(self, "Export Complete", f"Container manifest exported successfully to:\n{path}")
+        record_log(self.username, "EXPORT_EXCEL", f"Exported Container Manifest: {cnt_num} for client {client_name}")
+        QMessageBox.information(
+            self, "Export Complete",
+            f"Container manifest exported successfully to:\\n{path}"
+        )
 
     def export_client_dossier_excel(self):
         client_id = self.combo_dossier_client.currentData()
