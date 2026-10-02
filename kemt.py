@@ -2645,7 +2645,11 @@ class MainEnterpriseApp(QMainWindow):
 
                 invoice_item = QTableWidgetItem(f"📄 Invoice: {invoice_num}")
                 invoice_item.setFlags(invoice_item.flags() & ~Qt.ItemIsEditable)
-                invoice_item.setStyleSheet("font-weight: bold; background-color: #e9ecef; padding: 6px;")
+                invoice_font = QFont()
+                invoice_font.setBold(True)
+                invoice_item.setFont(invoice_font)
+                invoice_item.setBackground(QColor("#e9ecef"))
+                invoice_item.setForeground(QColor("#212529"))
                 self.table_cnt_items.setItem(header_row, 0, invoice_item)
 
                 current_invoice = invoice_num
