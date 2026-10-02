@@ -1509,6 +1509,7 @@ class MainEnterpriseApp(QMainWindow):
 
             sel_cnt_box.addWidget(QLabel("<b>Select Container / اختر الحاوية:</b>"))
             self.combo_rep_cnt = QComboBox()
+            self.combo_rep_cnt.setMinimumWidth(320)
             self.combo_rep_cnt.setStyleSheet("font-weight: bold; padding: 4px 10px;")
             self.combo_rep_cnt.currentIndexChanged.connect(self.load_container_manifest)
             sel_cnt_box.addWidget(self.combo_rep_cnt)
