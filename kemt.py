@@ -1193,45 +1193,18 @@ class MainEnterpriseApp(QMainWindow):
         self.page_pur.setLayout(l_pur)
         self.stack.addWidget(self.page_pur)
 
-        # ---------------- 2. شاشة الشحن وتتبع الحالة السريع ----------------
-        self.page_ship = QWidget()
-        l_ship = QVBoxLayout()
-
-        self.box_quick_track = QGroupBox()
-        qs_layout = QHBoxLayout()
-
-        self.combo_update_cnt = QComboBox()
-        self.combo_update_cnt.setStyleSheet("font-weight: bold;")
-        self.combo_update_status = QComboBox()
-        self.combo_update_status.addItems([
-            "قيد الشحن (In-Transit)",
-            "وصلت الميناء (Arrived at Port)",
-            "تحت التخليص الجمركي (Under Customs)",
-            "تم الإفراج والمخزنة (Cleared & Stocked)"
-        ])
-        
-        self.btn_apply_quick_status = QPushButton()
-        self.btn_apply_quick_status.setStyleSheet("background-color: #ffc107; color: black; font-weight: bold; padding: 6px 14px;")
-        self.btn_apply_quick_status.clicked.connect(self.update_container_status_by_user)
-
-        qs_layout.addWidget(QLabel("Container / الحاوية:"))
-        qs_layout.addWidget(self.combo_update_cnt)
-        qs_layout.addWidget(QLabel("New Status / الحالة الجديدة:"))
-        qs_layout.addWidget(self.combo_update_status)
-        qs_layout.addWidget(self.btn_apply_quick_status)
-        qs_layout.addStretch()
-
-        self.box_quick_track.setLayout(qs_layout)
-        l_ship.addWidget(self.box_quick_track)
-
+        # ---------------- 2. شاشة الشحن ----------------
         self.box_ship = QGroupBox()
         f_ship = QFormLayout()
 
         r1 = QHBoxLayout()
         self.lbl_cnt_num = QLabel()
         self.ship_cnt_num = QLineEdit()
+        self.ship_cnt_num.setReadOnly(True)
+        self.ship_cnt_num.setPlaceholderText("Auto-generated")
         self.lbl_client2 = QLabel()
         self.ship_client = QComboBox()
+        self.ship_client.currentIndexChanged.connect(self.on_shipping_client_changed)
         btn_c2 = QPushButton("+")
         btn_c2.setFixedWidth(30)
         btn_c2.clicked.connect(lambda: self.open_entity_manager('CLIENT'))
@@ -1620,43 +1593,6 @@ class MainEnterpriseApp(QMainWindow):
         self.switch_view(0)
 
     # ---------------- دوال الحساب اللحظي وتحديث حالة الحاوية ----------------
-    def update_container_status_by_user(self):
-        cnt_id = self.combo_update_cnt.currentData()
-        cnt_num = self.combo_update_cnt.currentText()
-        new_status = self.combo_update_status.currentText()
-
-        if not cnt_id:
-            QMessageBox.warning(self, "Warning", "Please select a container!")
-            return
-
-        if is_year_locked(self.current_year):
-            QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {self.current_year} is LOCKED!")
-            return
-
-        conn = sqlite3.connect("import_enterprise.db")
-        c = conn.cursor()
-        c.execute("SELECT client_id FROM containers WHERE id = ?", (cnt_id,))
-        row = c.fetchone()
-        client_id = row[0] if row else None
-        today_str = datetime.now().strftime("%Y-%m-%d")
-
-        c.execute("UPDATE containers SET status = ? WHERE id = ?", (new_status, cnt_id))
-
-        if "Cleared" in new_status or "الإفراج" in new_status:
-            c.execute("UPDATE containers SET stocked_status = 1 WHERE id = ?", (cnt_id,))
-            c.execute("""INSERT INTO ledger (tx_category, entity_id, container_id, currency, exchange_rate, amount, amount_local, tx_date, notes, fiscal_year, created_by)
-                         VALUES ('WAREHOUSE_STOCK', ?, ?, 'EGP', 1.0, 0, 0, ?, ?, ?, ?)""",
-                      (client_id, cnt_id, today_str, f"Stock Transfer: Cargo for Container {cnt_num} Cleared & Stored", self.current_year, self.username))
-
-        conn.commit()
-        conn.close()
-
-        record_log(self.username, "UPDATE_CONTAINER_STATUS", f"Updated container '{cnt_num}' status to '{new_status}'")
-        QMessageBox.information(self, "Success", f"Container {cnt_num} status updated to:\n{new_status}")
-        if self.role == "admin":
-            self.load_container_manifest()
-            self.load_client_dossier()
-
     def on_freight_currency_changed(self):
         curr_text = self.ship_freight_curr.currentText()
         if "USD" in curr_text:
@@ -2165,9 +2101,6 @@ class MainEnterpriseApp(QMainWindow):
         if not self.editing_invoice_id:
             self.btn_save_pur.setText(t['save_inv_btn'])
 
-        self.box_quick_track.setTitle(t.get('quick_track_box', 'Quick Status Tracking'))
-        self.btn_apply_quick_status.setText(t.get('btn_update_status_user', 'Update Status'))
-
         self.box_ship.setTitle(t['cnt_box'])
         self.lbl_cnt_num.setText(t['cnt_num'])
         self.lbl_client2.setText(t['client'])
@@ -2217,8 +2150,6 @@ class MainEnterpriseApp(QMainWindow):
         self.ship_customs.setToolTip(t['tip_cnt_customs'])
         self.ship_comm.setToolTip(t['tip_cnt_comm'])
         self.ship_total_egp.setToolTip(t['tip_cnt_total_egp'])
-        self.btn_apply_quick_status.setToolTip(t['tip_cnt_quick_status'])
-
         self.pay_client.setToolTip(t['tip_pay_client'])
         self.pay_client_amt.setToolTip(t['tip_pay_amt'])
         self.pay_fx.setToolTip(t['tip_pay_fx'])
@@ -2374,6 +2305,38 @@ class MainEnterpriseApp(QMainWindow):
 
 
     # ---------------- حفظ وتوزيع مصاريف الحاوية ----------------
+    def on_shipping_client_changed(self):
+        """Generate the next container number for the selected client."""
+        client_id = self.ship_client.currentData()
+        if not client_id:
+            self.ship_cnt_num.clear()
+            return
+
+        conn = sqlite3.connect("import_enterprise.db")
+        try:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COUNT(*) FROM containers WHERE client_id = ?",
+                (client_id,)
+            )
+            next_seq = (c.fetchone()[0] or 0) + 1
+
+            # Keep the number unique globally while maintaining a separate
+            # sequence for every client: C<client_id>-<client sequence>.
+            container_num = f"C{int(client_id):03d}-{next_seq:04d}"
+
+            # Protect against gaps/collisions if containers were deleted.
+            while c.execute(
+                "SELECT 1 FROM containers WHERE container_num = ?",
+                (container_num,)
+            ).fetchone():
+                next_seq += 1
+                container_num = f"C{int(client_id):03d}-{next_seq:04d}"
+
+            self.ship_cnt_num.setText(container_num)
+        finally:
+            conn.close()
+
     def save_container_data(self):
         if is_year_locked(self.current_year):
             QMessageBox.critical(self,"Fiscal Lock",f"Fiscal Year {self.current_year} is LOCKED! Cannot record container.")
@@ -2397,7 +2360,7 @@ class MainEnterpriseApp(QMainWindow):
         status=self.ship_status.currentText()
         today=datetime.now().strftime("%Y-%m-%d")
         if not c_num or not client_id:
-            QMessageBox.warning(self,"Warning","Please specify Container No and Client!")
+            QMessageBox.warning(self,"Warning","Please select a Client. Container No is generated automatically.")
             return
         if self.ship_items_table.rowCount()==0:
             QMessageBox.warning(self,"Warning","Pull at least one unshipped invoice item into the container.")
