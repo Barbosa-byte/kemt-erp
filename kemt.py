@@ -1500,16 +1500,17 @@ class MainEnterpriseApp(QMainWindow):
             l_cr = QVBoxLayout()
 
             sel_cnt_box = QHBoxLayout()
+            sel_cnt_box.addWidget(QLabel("<b>Select Client / اختر العميل:</b>"))
+            self.combo_rep_client = QComboBox()
+            self.combo_rep_client.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+            self.combo_rep_client.currentIndexChanged.connect(self.load_report_containers)
+            sel_cnt_box.addWidget(self.combo_rep_client)
+
             sel_cnt_box.addWidget(QLabel("<b>Select Container / اختر الحاوية:</b>"))
             self.combo_rep_cnt = QComboBox()
             self.combo_rep_cnt.setStyleSheet("font-weight: bold; padding: 4px 10px;")
             self.combo_rep_cnt.currentIndexChanged.connect(self.load_container_manifest)
             sel_cnt_box.addWidget(self.combo_rep_cnt)
-
-            self.btn_update_status = QPushButton("Change Status / الترحيل للمخزن")
-            self.btn_update_status.setStyleSheet("background-color: #0d6efd; color: white; font-weight: bold; padding: 6px;")
-            self.btn_update_status.clicked.connect(self.mark_container_cleared)
-            sel_cnt_box.addWidget(self.btn_update_status)
 
             self.btn_export_cnt = QPushButton()
             self.btn_export_cnt.setStyleSheet("background-color: #198754; color: white; font-weight: bold; padding: 6px 14px;")
@@ -1523,7 +1524,7 @@ class MainEnterpriseApp(QMainWindow):
             self.lbl_cnt_header.setStyleSheet("font-size: 13px; font-weight: bold; background-color: #e9ecef; padding: 8px; border-radius: 4px;")
             l_cr.addWidget(self.lbl_cnt_header)
 
-            l_cr.addWidget(QLabel("<b>Container Items & Landed Costing:</b>"))
+            l_cr.addWidget(QLabel("<b>Invoices & Container Items / الفواتير والأصناف:</b>"))
             self.table_cnt_items = QTableWidget()
             self.table_cnt_items.setColumnCount(9)
             self.table_cnt_items.setHorizontalHeaderLabels([
@@ -2195,6 +2196,7 @@ class MainEnterpriseApp(QMainWindow):
         self.exp_container.clear()
 
         if self.role == "admin":
+            self.combo_rep_client.clear()
             self.combo_rep_cnt.clear()
             self.combo_dossier_client.clear()
 
@@ -2207,6 +2209,7 @@ class MainEnterpriseApp(QMainWindow):
             self.ship_client.addItem(r[1], r[0])
             self.pay_client.addItem(r[1], r[0])
             if self.role == "admin":
+                self.combo_rep_client.addItem(r[1], r[0])
                 self.combo_dossier_client.addItem(r[1], r[0])
 
         c.execute("SELECT id, name FROM entities WHERE entity_type = 'SUPPLIER'")
@@ -2218,13 +2221,14 @@ class MainEnterpriseApp(QMainWindow):
         for r in c.fetchall():
             self.ship_agent.addItem(r[1], r[0])
 
-        c.execute("SELECT id, container_num FROM containers")
+        c.execute("SELECT id, container_num FROM containers ORDER BY id DESC")
         for r in c.fetchall():
             self.exp_container.addItem(f"Container: {r[1]}", r[0])
-            if self.role == "admin":
-                self.combo_rep_cnt.addItem(f"{r[1]}", r[0])
 
         conn.close()
+
+        if self.role == "admin":
+            self.load_report_containers()
 
     def pick_file(self, target_line_edit):
         path, _ = QFileDialog.getOpenFileName(self, "Select Document", "", "All Files (*.*)")
@@ -2543,9 +2547,46 @@ class MainEnterpriseApp(QMainWindow):
         QMessageBox.information(self, "Success", "Expense saved successfully.")
         self.populate_fiscal_years()
 
+    def load_report_containers(self):
+        """Load only the containers belonging to the selected report client."""
+        if self.role != "admin" or not hasattr(self, 'combo_rep_client'):
+            return
+
+        client_id = self.combo_rep_client.currentData()
+        self.combo_rep_cnt.blockSignals(True)
+        self.combo_rep_cnt.clear()
+
+        if not client_id:
+            self.combo_rep_cnt.blockSignals(False)
+            self.lbl_cnt_header.setText("Container Info: -")
+            self.table_cnt_items.setRowCount(0)
+            return
+
+        conn = sqlite3.connect("import_enterprise.db")
+        rows = conn.execute(
+            "SELECT id, container_num FROM containers WHERE client_id=? ORDER BY id DESC",
+            (client_id,)
+        ).fetchall()
+        conn.close()
+
+        for container_id, container_num in rows:
+            self.combo_rep_cnt.addItem(str(container_num), container_id)
+
+        self.combo_rep_cnt.blockSignals(False)
+
+        if rows:
+            self.combo_rep_cnt.setCurrentIndex(0)
+            self.load_container_manifest()
+        else:
+            self.lbl_cnt_header.setText(
+                f"Container Info: No containers found for {self.combo_rep_client.currentText()}"
+            )
+            self.table_cnt_items.setRowCount(0)
+
     def load_container_manifest(self):
         if self.role != "admin" or not hasattr(self, 'combo_rep_cnt'):
             return
+
         cnt_id = self.combo_rep_cnt.currentData()
         if not cnt_id:
             self.lbl_cnt_header.setText("Container Info: -")
@@ -2556,33 +2597,75 @@ class MainEnterpriseApp(QMainWindow):
         c = conn.cursor()
 
         c.execute("""
-        SELECT c.container_num, e.name, c.shipping_line, c.bill_of_lading, c.arrival_date, c.status, c.total_container_cost
+        SELECT c.container_num, e.name, c.shipping_line, c.bill_of_lading, c.arrival_date,
+               c.total_container_cost
         FROM containers c
         LEFT JOIN entities e ON c.client_id = e.id
         WHERE c.id = ?
         """, (cnt_id,))
         cnt = c.fetchone()
 
-        if cnt:
-            info_text = f"Container: {cnt[0]} | Client: {cnt[1]} | Line: {cnt[2]} | B/L: {cnt[3]} | Arrival: {cnt[4]} | Status: {cnt[5]} | Total Cost: {cnt[6]:,.2f} EGP"
-            self.lbl_cnt_header.setText(info_text)
+        if not cnt:
+            conn.close()
+            self.lbl_cnt_header.setText("Container Info: -")
+            self.table_cnt_items.setRowCount(0)
+            return
 
+        info_text = (
+            f"Container: {cnt[0]} | Client: {cnt[1]} | Line: {cnt[2] or '-'} | "
+            f"B/L: {cnt[3] or '-'} | Arrival: {cnt[4] or '-'} | "
+            f"Total Cost: {cnt[5] or 0:,.2f} EGP"
+        )
+        self.lbl_cnt_header.setText(info_text)
+
+        # Keep the real invoice relationship and group the cargo visually:
+        # Invoice header row -> its items -> next invoice header -> its items.
         c.execute("""
-        SELECT item_code, item_ar, item_cn, cartons, piece_price, cbm, weight, allocated_expense, landed_cost_unit 
-        FROM container_items WHERE container_id = ?
+        SELECT ci.source_invoice_num, ci.item_code, ci.item_ar, ci.item_cn,
+               ci.cartons, ci.piece_price,
+               COALESCE(ci.total_cbm, ci.cbm, 0), ci.weight,
+               ci.allocated_expense, ci.landed_cost_unit
+        FROM container_items ci
+        WHERE ci.container_id = ?
+        ORDER BY ci.source_invoice_num, ci.id
         """, (cnt_id,))
         items = c.fetchall()
         conn.close()
 
         self.table_cnt_items.setRowCount(0)
-        for idx, itm in enumerate(items):
-            self.table_cnt_items.insertRow(idx)
-            for col_idx, val in enumerate(itm):
-                if col_idx in [4, 7, 8] and isinstance(val, (int, float)):
+        current_invoice = None
+
+        for row in items:
+            invoice_num = row[0] or "Unknown Invoice"
+
+            if invoice_num != current_invoice:
+                header_row = self.table_cnt_items.rowCount()
+                self.table_cnt_items.insertRow(header_row)
+                self.table_cnt_items.setSpan(header_row, 0, 1, 9)
+
+                invoice_item = QTableWidgetItem(f"📄 Invoice: {invoice_num}")
+                invoice_item.setFlags(invoice_item.flags() & ~Qt.ItemIsEditable)
+                invoice_item.setStyleSheet("font-weight: bold; background-color: #e9ecef; padding: 6px;")
+                self.table_cnt_items.setItem(header_row, 0, invoice_item)
+
+                current_invoice = invoice_num
+
+            data_row = self.table_cnt_items.rowCount()
+            self.table_cnt_items.insertRow(data_row)
+
+            display_values = [
+                row[1], row[2], row[3], row[4], row[5],
+                row[6], row[7], row[8], row[9]
+            ]
+
+            for col_idx, val in enumerate(display_values):
+                if col_idx in [4, 5, 7, 8] and isinstance(val, (int, float)):
                     txt = f"{val:,.2f}"
                 else:
                     txt = str(val if val is not None else "")
-                self.table_cnt_items.setItem(idx, col_idx, QTableWidgetItem(txt))
+                self.table_cnt_items.setItem(data_row, col_idx, QTableWidgetItem(txt))
+
+        self.table_cnt_items.resizeRowsToContents()
 
     def mark_container_cleared(self):
         cnt_id = self.combo_rep_cnt.currentData()
