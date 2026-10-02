@@ -429,6 +429,17 @@ def init_database():
         FOREIGN KEY (supplier_id) REFERENCES entities(id),
         FOREIGN KEY (invoice_id) REFERENCES client_invoices(id)
     )""")
+    # Migration: older databases may already have supplier_ledger without the
+    # supplier_invoice_num column. CREATE TABLE IF NOT EXISTS does not alter
+    # an existing SQLite table, so add the column before creating the index.
+    c.execute("PRAGMA table_info(supplier_ledger)")
+    supplier_ledger_columns = {row[1] for row in c.fetchall()}
+    if "supplier_invoice_num" not in supplier_ledger_columns:
+        c.execute("""
+            ALTER TABLE supplier_ledger
+            ADD COLUMN supplier_invoice_num TEXT
+        """)
+
     c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_supplier_invoice_debt
                  ON supplier_ledger(supplier_id, supplier_invoice_num, tx_type)
                  WHERE tx_type = 'INVOICE' AND supplier_invoice_num IS NOT NULL AND supplier_invoice_num <> ''""")
