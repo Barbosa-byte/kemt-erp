@@ -1765,61 +1765,6 @@ class MainEnterpriseApp(QMainWindow):
         t=TRANSLATIONS[self.current_lang]
         self.btn_save_pur.setText(t.get('update_inv_btn','Update Purchase Invoice'))
         self.btn_save_pur.setStyleSheet("background-color:#ffc107;color:black;font-weight:bold;padding:7px;")
-        self.btn_cancel_pur_edit.setVisible(True)
-
-
-        conn = sqlite3.connect("import_enterprise.db")
-        c = conn.cursor()
-        c.execute("""SELECT id, invoice_num, client_id, supplier_id, currency, exchange_rate, total_amount, net_amount, total_cbm, fiscal_year
-                     FROM client_invoices WHERE id = ?""", (invoice_id,))
-        inv = c.fetchone()
-        if not inv:
-            conn.close()
-            return
-
-        if is_year_locked(inv[9]):
-            conn.close()
-            QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {inv[9]} is LOCKED! Cannot modify this invoice.")
-            return
-
-        self.editing_invoice_id = invoice_id
-        self.pur_inv_num.setText(inv[1])
-
-        idx_c = self.pur_client.findData(inv[2])
-        if idx_c != -1:
-            self.pur_client.setCurrentIndex(idx_c)
-
-        idx_s = self.pur_supplier.findData(inv[3])
-        if idx_s != -1:
-            self.pur_supplier.setCurrentIndex(idx_s)
-
-        idx_curr = self.pur_curr.findText(inv[4] or "USD")
-        if idx_curr != -1:
-            self.pur_curr.setCurrentIndex(idx_curr)
-
-        self.pur_fx_rate.setText(str(inv[5]))
-
-        c.execute("SELECT item_code, item_ar, item_cn, cartons, piece_price, cbm, weight FROM invoice_items WHERE invoice_id = ?", (invoice_id,))
-        items = c.fetchall()
-        conn.close()
-
-        self.pur_table.setRowCount(0)
-        if items:
-            for r_idx, itm in enumerate(items):
-                self.pur_table.insertRow(r_idx)
-                for c_idx, val in enumerate(itm):
-                    self.pur_table.setItem(r_idx, c_idx, QTableWidgetItem(str(val) if val is not None else ""))
-            self.recalc_purchase_totals()
-        else:
-            self.pur_table.setRowCount(5)
-            self.pur_total.setText(f"{inv[6]:,.2f}")
-            self.on_pur_total_or_fx_changed()
-
-        t = TRANSLATIONS[self.current_lang]
-        self.btn_save_pur.setText(t.get('update_inv_btn', 'Update Purchase Invoice'))
-        self.btn_save_pur.setStyleSheet("background-color: #ffc107; color: black; font-weight: bold; padding: 7px;")
-        self.btn_cancel_pur_edit.setVisible(True)
-
     def reset_purchase_form(self):
         self.editing_invoice_id=None
         self.pur_inv_num.clear()
@@ -1836,22 +1781,6 @@ class MainEnterpriseApp(QMainWindow):
         t=TRANSLATIONS[self.current_lang]
         self.btn_save_pur.setText(t['save_inv_btn'])
         self.btn_save_pur.setStyleSheet("background-color:#0d6efd;color:white;font-weight:bold;padding:7px;")
-        self.btn_cancel_pur_edit.setVisible(False)
-
-
-        self.editing_invoice_id = None
-        self.pur_inv_num.clear()
-        self.pur_table.clearContents()
-        self.pur_table.setRowCount(5)
-        self.pur_total.clear()
-        self.pur_net.clear()
-        self.pur_cbm.clear()
-
-        t = TRANSLATIONS[self.current_lang]
-        self.btn_save_pur.setText(t['save_inv_btn'])
-        self.btn_save_pur.setStyleSheet("background-color: #0d6efd; color: white; font-weight: bold; padding: 7px;")
-        self.btn_cancel_pur_edit.setVisible(False)
-
     def delete_invoice(self, invoice_id, invoice_num):
         conn=sqlite3.connect("import_enterprise.db")
         c=conn.cursor()
@@ -1876,32 +1805,6 @@ class MainEnterpriseApp(QMainWindow):
         record_log(self.username,"DELETE_INVOICE",f"Deleted invoice '{invoice_num}' (ID: {invoice_id})")
         QMessageBox.information(self,"Deleted",f"Invoice '{invoice_num}' deleted successfully.")
         if self.editing_invoice_id==invoice_id: self.reset_purchase_form()
-        self.load_registered_invoices()
-
-
-        conn = sqlite3.connect("import_enterprise.db")
-        c = conn.cursor()
-        c.execute("SELECT fiscal_year FROM client_invoices WHERE id = ?", (invoice_id,))
-        row = c.fetchone()
-        if row and is_year_locked(row[0]):
-            conn.close()
-            QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {row[0]} is LOCKED! Cannot delete invoice.")
-            return
-
-        reply = QMessageBox.question(self, "Confirm Delete", f"Are you sure you want to delete invoice '{invoice_num}'?", QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            c.execute("DELETE FROM client_invoices WHERE id = ?", (invoice_id,))
-            c.execute("DELETE FROM invoice_items WHERE invoice_id = ?", (invoice_id,))
-            conn.commit()
-            conn.close()
-            record_log(self.username, "DELETE_INVOICE", f"Deleted invoice '{invoice_num}' (ID: {invoice_id})")
-            QMessageBox.information(self, "Deleted", f"Invoice '{invoice_num}' deleted successfully.")
-            if self.editing_invoice_id == invoice_id:
-                self.reset_purchase_form()
-            self.load_registered_invoices()
-        else:
-            conn.close()
-
     def save_purchase_invoice(self):
         if is_year_locked(self.current_year):
             QMessageBox.critical(self,"Fiscal Lock",f"Fiscal Year {self.current_year} is LOCKED! Cannot insert or modify records.")
@@ -2009,79 +1912,6 @@ class MainEnterpriseApp(QMainWindow):
         except sqlite3.IntegrityError as e:
             conn.rollback()
             QMessageBox.warning(self,"Error",f"Could not save invoice: {e}")
-        finally:
-            conn.close()
-
-
-        if is_year_locked(self.current_year):
-            QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {self.current_year} is LOCKED! Cannot insert or modify records.")
-            return
-
-        num = self.pur_inv_num.text().strip()
-        c_id = self.pur_client.currentData()
-        s_id = self.pur_supplier.currentData()
-        curr = self.pur_curr.currentText()
-        fx = float(self.pur_fx_rate.text().replace(',', '').strip() or 1.0)
-        tot = float(self.pur_total.text().replace(',', '').strip() or 0)
-        tot_local = tot * fx
-        net = float(self.pur_net.text().replace(',', '').strip() or tot_local)
-        cbm = float(self.pur_cbm.text().replace(',', '').strip() or 0)
-
-        if not num or not c_id:
-            QMessageBox.warning(self, "Warning", "Please enter Invoice Number and Client!")
-            return
-
-        conn = sqlite3.connect("import_enterprise.db")
-        try:
-            if self.editing_invoice_id:
-                conn.execute("""UPDATE client_invoices 
-                                SET invoice_num=?, client_id=?, supplier_id=?, currency=?, exchange_rate=?, total_amount=?, total_amount_local=?, net_amount=?, total_cbm=?
-                                WHERE id=?""", 
-                             (num, c_id, s_id, curr, fx, tot, tot_local, net, cbm, self.editing_invoice_id))
-                target_inv_id = self.editing_invoice_id
-                conn.execute("DELETE FROM invoice_items WHERE invoice_id = ?", (target_inv_id,))
-                msg_title = "Invoice Updated Successfully."
-                record_log(self.username, "UPDATE_INVOICE", f"Updated invoice #{num} (Total: {tot} {curr})")
-            else:
-                cur = conn.cursor()
-                cur.execute("""INSERT INTO client_invoices (invoice_num, client_id, supplier_id, currency, exchange_rate, total_amount, total_amount_local, net_amount, total_cbm, fiscal_year)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
-                             (num, c_id, s_id, curr, fx, tot, tot_local, net, cbm, self.current_year))
-                target_inv_id = cur.lastrowid
-                msg_title = "Invoice registered successfully."
-                record_log(self.username, "CREATE_INVOICE", f"Created invoice #{num} (Total: {tot} {curr})")
-
-            for row in range(self.pur_table.rowCount()):
-                code = self.pur_table.item(row, 0)
-                name_ar = self.pur_table.item(row, 1)
-                name_cn = self.pur_table.item(row, 2)
-                cartons = self.pur_table.item(row, 3)
-                price = self.pur_table.item(row, 4)
-                cbm_i = self.pur_table.item(row, 5)
-                weight = self.pur_table.item(row, 6)
-
-                if name_ar and name_ar.text().strip():
-                    c_code = code.text().strip() if code else ""
-                    c_name_ar = name_ar.text().strip()
-                    c_name_cn = name_cn.text().strip() if name_cn else ""
-                    c_cartons = int(cartons.text().strip()) if cartons and cartons.text().strip().isdigit() else 0
-                    c_price = float(price.text().strip()) if price and price.text().strip() else 0.0
-                    c_cbm = float(cbm_i.text().strip()) if cbm_i and cbm_i.text().strip() else 0.0
-                    c_weight = float(weight.text().strip()) if weight and weight.text().strip() else 0.0
-
-                    conn.execute("""INSERT INTO invoice_items (invoice_id, item_code, item_ar, item_cn, cartons, piece_price, cbm, weight)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                                 (target_inv_id, c_code, c_name_ar, c_name_cn, c_cartons, c_price, c_cbm, c_weight))
-
-            conn.commit()
-            QMessageBox.information(self, "Success", msg_title)
-            self.reset_purchase_form()
-            self.load_registered_invoices()
-        except sqlite3.IntegrityError:
-            QMessageBox.warning(self, "Error", "Invoice Number already exists! Please use a unique number.")
-        finally:
-            conn.close()
-
     def on_pur_currency_changed(self):
         curr = self.pur_curr.currentText()
         if curr == "USD":
@@ -2152,45 +1982,6 @@ class MainEnterpriseApp(QMainWindow):
             item=QTableWidgetItem("")
             self.pur_table.setItem(row,col,item)
         item.setText(f"{value:,.2f}" if col in [7,9] else f"{int(value)}")
-        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-
-
-        if self._is_calculating or column not in [3, 4, 5]:
-            return
-        self.recalc_purchase_totals()
-
-    def recalc_purchase_totals(self):
-        self._is_calculating = True
-        tot_val = 0.0
-        tot_cbm = 0.0
-        
-        try:
-            fx_str = self.pur_fx_rate.text().replace(',', '').strip()
-            fx = float(fx_str) if fx_str else 1.0
-        except ValueError:
-            fx = 1.0
-
-        for r in range(self.pur_table.rowCount()):
-            cartons_item = self.pur_table.item(r, 3)
-            price_item = self.pur_table.item(r, 4)
-            cbm_item = self.pur_table.item(r, 5)
-
-            try:
-                cartons = float(cartons_item.text().strip()) if cartons_item and cartons_item.text().strip() else 0.0
-                price = float(price_item.text().strip()) if price_item and price_item.text().strip() else 0.0
-                cbm = float(cbm_item.text().strip()) if cbm_item and cbm_item.text().strip() else 0.0
-
-                tot_val += (cartons * price)
-                tot_cbm += cbm
-            except ValueError:
-                pass
-
-        if tot_val > 0 or tot_cbm > 0:
-            self.pur_total.setText(f"{tot_val:,.2f}")
-            self.pur_net.setText(f"{(tot_val * fx):,.2f}")
-            self.pur_cbm.setText(f"{tot_cbm:,.2f}")
-        self._is_calculating = False
-
     def import_excel_to_table(self, table):
         path,_=QFileDialog.getOpenFileName(self,"Select Packing List Excel","","Excel Files (*.xlsx *.xls)")
         if not path: return
@@ -2666,113 +2457,6 @@ class MainEnterpriseApp(QMainWindow):
         except sqlite3.IntegrityError:
             conn.rollback()
             QMessageBox.warning(self,"Error","Container No already exists!")
-        finally:
-            conn.close()
-
-
-        if is_year_locked(self.current_year):
-            QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {self.current_year} is LOCKED! Cannot record container.")
-            return
-
-        c_num = self.ship_cnt_num.text().strip()
-        c_id = self.ship_client.currentData()
-        agent_id = self.ship_agent.currentData()
-        line = self.ship_line.text().strip()
-        bol = self.ship_bol.text().strip()
-
-        freight_curr_raw = self.ship_freight_curr.currentText()
-        freight_curr = "USD" if "USD" in freight_curr_raw else ("RMB" if "RMB" in freight_curr_raw else ("EUR" if "EUR" in freight_curr_raw else "EGP"))
-        freight_amt = float(self.ship_freight.text().replace(',', '').strip() or 0)
-        freight_fx = float(self.ship_freight_fx.text().replace(',', '').strip() or 1.0)
-        freight_egp = freight_amt * freight_fx
-
-        customs_egp = float(self.ship_customs.text().replace(',', '').strip() or 0)
-        comm_egp = float(self.ship_comm.text().replace(',', '').strip() or 0)
-
-        total_cost_egp = freight_egp + customs_egp + comm_egp
-        status = self.ship_status.currentText()
-        today_str = datetime.now().strftime("%Y-%m-%d")
-
-        if not c_num or not c_id:
-            QMessageBox.warning(self, "Warning", "Please specify Container No and Client!")
-            return
-
-        items_payload = []
-        container_total_cbm = 0.0
-
-        for row in range(self.ship_items_table.rowCount()):
-            code = self.ship_items_table.item(row, 0)
-            name_ar = self.ship_items_table.item(row, 1)
-            name_cn = self.ship_items_table.item(row, 2)
-            cartons = self.ship_items_table.item(row, 3)
-            price = self.ship_items_table.item(row, 4)
-            cbm = self.ship_items_table.item(row, 5)
-            weight = self.ship_items_table.item(row, 6)
-
-            if name_ar and name_ar.text().strip():
-                c_code = code.text().strip() if code else ""
-                c_name_ar = name_ar.text().strip()
-                c_name_cn = name_cn.text().strip() if name_cn else ""
-                c_cartons = int(cartons.text().strip()) if cartons and cartons.text().strip().isdigit() else 0
-                c_price = float(price.text().strip()) if price and price.text().strip() else 0.0
-                c_cbm = float(cbm.text().strip()) if cbm and cbm.text().strip() else 0.0
-                c_weight = float(weight.text().strip()) if weight and weight.text().strip() else 0.0
-
-                container_total_cbm += c_cbm
-                items_payload.append({
-                    'code': c_code, 'name_ar': c_name_ar, 'name_cn': c_name_cn,
-                    'cartons': c_cartons, 'price': c_price, 'cbm': c_cbm, 'weight': c_weight
-                })
-
-        conn = sqlite3.connect("import_enterprise.db")
-        try:
-            cur = conn.cursor()
-            cur.execute("""INSERT INTO containers 
-                (container_num, client_id, agent_id, shipping_line, bill_of_lading, freight_currency, sea_freight, freight_exchange_rate, customs_cost, commission, total_container_cost, status, arrival_date, currency, exchange_rate, fiscal_year)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EGP', 1.0, ?)""",
-                (c_num, c_id, agent_id, line, bol, freight_curr, freight_amt, freight_fx, customs_egp, comm_egp, total_cost_egp, status, today_str, self.current_year))
-            container_id = cur.lastrowid
-
-            for itm in items_payload:
-                allocated_exp_egp = 0.0
-                landed_cost_unit = itm['price']
-
-                if container_total_cbm > 0 and itm['cbm'] > 0:
-                    allocated_exp_egp = (itm['cbm'] / container_total_cbm) * total_cost_egp
-                    if itm['cartons'] > 0:
-                        landed_cost_unit = itm['price'] + (allocated_exp_egp / itm['cartons'])
-
-                conn.execute("""INSERT INTO container_items 
-                    (container_id, item_code, item_ar, item_cn, cartons, piece_price, cbm, weight, allocated_expense, landed_cost_unit)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (container_id, itm['code'], itm['name_ar'], itm['name_cn'], itm['cartons'], itm['price'], itm['cbm'], itm['weight'], allocated_exp_egp, landed_cost_unit))
-
-            conn.execute("""INSERT INTO ledger (tx_category, entity_id, container_id, currency, exchange_rate, amount, amount_local, tx_date, notes, fiscal_year, created_by)
-                            VALUES ('EXPENSE', ?, ?, 'EGP', 1.0, ?, ?, ?, ?, ?, ?)""",
-                         (c_id, container_id, total_cost_egp, total_cost_egp, today_str, f"Container Cost: {c_num} ({status}) [Freight: {freight_amt}{freight_curr}, Customs: {customs_egp:,.2f} EGP]", self.current_year, self.username))
-
-            if "Cleared" in status or "الإفراج" in status:
-                conn.execute("UPDATE containers SET stocked_status = 1 WHERE id = ?", (container_id,))
-                conn.execute("""INSERT INTO ledger (tx_category, entity_id, container_id, currency, exchange_rate, amount, amount_local, tx_date, notes, fiscal_year, created_by)
-                                VALUES ('WAREHOUSE_STOCK', ?, ?, 'EGP', 1.0, 0, 0, ?, ?, ?, ?)""",
-                             (c_id, container_id, today_str, f"Stock Transfer: Cargo for Container {c_num} Cleared & Stored", self.current_year, self.username))
-
-            conn.commit()
-            record_log(self.username, "SAVE_CONTAINER", f"Registered container '{c_num}' (Total: {total_cost_egp:,.2f} EGP)")
-            QMessageBox.information(self, "Success", f"Container registered successfully.\nTotal Cost: {total_cost_egp:,.2f} EGP allocated to cargo.")
-            self.ship_cnt_num.clear()
-            self.ship_items_table.clearContents()
-            self.ship_freight.setText("0.0")
-            self.ship_customs.setText("0.0")
-            self.ship_comm.setText("0.0")
-            self.ship_total_egp.setText("0.00 EGP")
-            self.refresh_all_dropdowns()
-            self.populate_fiscal_years()
-        except sqlite3.IntegrityError:
-            QMessageBox.warning(self, "Error", "Container No already exists!")
-        finally:
-            conn.close()
-
     def save_client_payment(self):
         if is_year_locked(self.current_year):
             QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {self.current_year} is LOCKED!")
