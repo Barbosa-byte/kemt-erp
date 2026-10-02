@@ -341,9 +341,15 @@ def init_database():
         item_ar TEXT,
         item_cn TEXT,
         cartons INTEGER DEFAULT 0,
+        pcs_per_carton INTEGER DEFAULT 1,
+        total_pcs INTEGER DEFAULT 0,
         piece_price REAL DEFAULT 0,
+        total_price REAL DEFAULT 0,
+        cbm_per_carton REAL DEFAULT 0,
+        total_cbm REAL DEFAULT 0,
         cbm REAL DEFAULT 0,
         weight REAL DEFAULT 0,
+        shipped_status INTEGER DEFAULT 0,
         FOREIGN KEY (invoice_id) REFERENCES client_invoices(id)
     )""")
 
@@ -371,12 +377,18 @@ def init_database():
     c.execute("""CREATE TABLE IF NOT EXISTS container_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         container_id INTEGER NOT NULL,
+        invoice_item_id INTEGER,
+        source_invoice_num TEXT,
         item_code TEXT,
         item_ar TEXT,
         item_cn TEXT,
         cartons INTEGER DEFAULT 0,
+        pcs_per_carton INTEGER DEFAULT 1,
+        total_pcs INTEGER DEFAULT 0,
         piece_price REAL DEFAULT 0,
+        total_price REAL DEFAULT 0,
         cbm REAL DEFAULT 0,
+        total_cbm REAL DEFAULT 0,
         weight REAL DEFAULT 0,
         allocated_expense REAL DEFAULT 0,
         landed_cost_unit REAL DEFAULT 0,
@@ -399,6 +411,27 @@ def init_database():
         fiscal_year INTEGER,
         created_by TEXT
     )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS supplier_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        supplier_id INTEGER NOT NULL,
+        invoice_id INTEGER,
+        tx_type TEXT NOT NULL,
+        amount REAL NOT NULL DEFAULT 0,
+        amount_local REAL NOT NULL DEFAULT 0,
+        currency TEXT DEFAULT 'EGP',
+        exchange_rate REAL DEFAULT 1.0,
+        supplier_invoice_num TEXT,
+        reason TEXT NOT NULL,
+        tx_date TEXT,
+        method TEXT,
+        created_by TEXT,
+        FOREIGN KEY (supplier_id) REFERENCES entities(id),
+        FOREIGN KEY (invoice_id) REFERENCES client_invoices(id)
+    )""")
+    c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_supplier_invoice_debt
+                 ON supplier_ledger(supplier_id, supplier_invoice_num, tx_type)
+                 WHERE tx_type = 'INVOICE' AND supplier_invoice_num IS NOT NULL AND supplier_invoice_num <> ''""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS fiscal_locks (
         year INTEGER PRIMARY KEY,
@@ -424,7 +457,17 @@ def init_database():
             ("exchange_rate", "REAL DEFAULT 1.0"),
             ("stocked_status", "INTEGER DEFAULT 0")
         ],
-        "container_items": [("allocated_expense", "REAL DEFAULT 0"), ("landed_cost_unit", "REAL DEFAULT 0")],
+        "container_items": [
+            ("allocated_expense", "REAL DEFAULT 0"), ("landed_cost_unit", "REAL DEFAULT 0"),
+            ("invoice_item_id", "INTEGER"), ("source_invoice_num", "TEXT"),
+            ("pcs_per_carton", "INTEGER DEFAULT 1"), ("total_pcs", "INTEGER DEFAULT 0"),
+            ("total_price", "REAL DEFAULT 0"), ("total_cbm", "REAL DEFAULT 0")
+        ],
+        "invoice_items": [
+            ("pcs_per_carton", "INTEGER DEFAULT 1"), ("total_pcs", "INTEGER DEFAULT 0"),
+            ("total_price", "REAL DEFAULT 0"), ("cbm_per_carton", "REAL DEFAULT 0"),
+            ("total_cbm", "REAL DEFAULT 0"), ("shipped_status", "INTEGER DEFAULT 0")
+        ],
         "ledger": [("currency", "TEXT DEFAULT 'EGP'"), ("exchange_rate", "REAL DEFAULT 1.0"), ("amount_local", "REAL NOT NULL DEFAULT 0")]
     }
 
@@ -942,6 +985,8 @@ class MainEnterpriseApp(QMainWindow):
             self.act_locks.triggered.connect(self.open_fiscal_lock_manager)
             self.act_logs = file_menu.addAction("")
             self.act_logs.triggered.connect(lambda: AuditLogDialog(self.username).exec_())
+            self.act_supplier_accounts = file_menu.addAction("Supplier Accounts")
+            self.act_supplier_accounts.triggered.connect(self.open_supplier_account)
         self.act_about = file_menu.addAction("")
         self.act_about.triggered.connect(self.show_about_dialog)
         file_menu.addSeparator()
@@ -1071,7 +1116,7 @@ class MainEnterpriseApp(QMainWindow):
         
         btn_add_pur_row = QPushButton("+ Add Item Row")
         btn_add_pur_row.setStyleSheet("background-color: #28a745; color: white; font-weight: bold;")
-        btn_add_pur_row.clicked.connect(lambda: self.pur_table.insertRow(self.pur_table.rowCount()))
+        btn_add_pur_row.clicked.connect(lambda: self.add_purchase_row())
         
         btn_del_pur_row = QPushButton("- Delete Selected Row")
         btn_del_pur_row.setStyleSheet("background-color: #dc3545; color: white;")
@@ -1083,10 +1128,18 @@ class MainEnterpriseApp(QMainWindow):
         pur_items_bar.addWidget(btn_del_pur_row)
         l_pur.addLayout(pur_items_bar)
 
-        self.pur_table = QTableWidget(5, 7)
+        self.pur_table = QTableWidget(5, 11)
         self.pur_table.setHorizontalHeaderLabels([
-            "Item Code", "Item Description (AR)", "Item Description (CN)", "Cartons", "Piece Price", "CBM", "Weight (KG)"
+            "Item Code", "Item Description (AR)", "Item Description (CN)", "Cartons",
+            "Pcs/Carton", "Total Pcs", "Piece Price", "Total Price",
+            "CBM/Carton", "Total CBM", "Weight (KG)"
         ])
+        self.pur_table.setToolTip("Maximum 15 item rows per purchase invoice.")
+        for row in range(self.pur_table.rowCount()):
+            for col in [5,7,9]:
+                item = QTableWidgetItem("")
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.pur_table.setItem(row,col,item)
         self.pur_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.pur_table.cellChanged.connect(self.on_pur_table_cell_changed)
         l_pur.addWidget(self.pur_table)
@@ -1250,31 +1303,22 @@ class MainEnterpriseApp(QMainWindow):
         l_ship.addWidget(self.box_ship)
 
         cnt_items_bar = QHBoxLayout()
-        cnt_items_bar.addWidget(QLabel("<b>Container Manifest & Cargo (أصناف الحاوية لحساب تكلفة القطعة Landed Cost):</b>"))
-        
-        self.btn_import_ship_excel = QPushButton("📥 Import Packing List (Excel)")
-        self.btn_import_ship_excel.setStyleSheet("background-color: #0dcaf0; font-weight: bold;")
-        self.btn_import_ship_excel.clicked.connect(lambda: self.import_excel_to_table(self.ship_items_table))
-        
-        btn_add_ship_row = QPushButton("+ Add Item Row")
-        btn_add_ship_row.setStyleSheet("background-color: #28a745; color: white; font-weight: bold;")
-        btn_add_ship_row.clicked.connect(lambda: self.ship_items_table.insertRow(self.ship_items_table.rowCount()))
-        
-        btn_del_ship_row = QPushButton("- Delete Selected Row")
-        btn_del_ship_row.setStyleSheet("background-color: #dc3545; color: white;")
-        btn_del_ship_row.clicked.connect(lambda: self.delete_table_row(self.ship_items_table))
-        
+        cnt_items_bar.addWidget(QLabel("<b>Container Cargo Picker (سحب البضاعة من فواتير الشراء غير المشحونة):</b>"))
         cnt_items_bar.addStretch()
-        cnt_items_bar.addWidget(self.btn_import_ship_excel)
-        cnt_items_bar.addWidget(btn_add_ship_row)
-        cnt_items_bar.addWidget(btn_del_ship_row)
+
+        self.btn_pull_ship_cargo = QPushButton("📥 Pull Unshipped Invoices")
+        self.btn_pull_ship_cargo.setStyleSheet("background-color:#0dcaf0;font-weight:bold;padding:6px;")
+        self.btn_pull_ship_cargo.clicked.connect(self.open_cargo_picker)
+        cnt_items_bar.addWidget(self.btn_pull_ship_cargo)
         l_ship.addLayout(cnt_items_bar)
 
-        self.ship_items_table = QTableWidget(5, 7)
+        self.ship_items_table = QTableWidget(0, 10)
         self.ship_items_table.setHorizontalHeaderLabels([
-            "Item Code", "Item Description (AR)", "Item Description (CN)", "Cartons", "Piece Price", "CBM", "Weight (KG)"
+            "Source Invoice", "Item Code", "Description (AR)", "Description (CN)",
+            "Cartons", "Pcs/Carton", "Total Pcs", "Piece Price", "Total CBM", "Weight (KG)"
         ])
         self.ship_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ship_items_table.setEditTriggers(QTableWidget.NoEditTriggers)
         l_ship.addWidget(self.ship_items_table)
 
         self.btn_save_ship = QPushButton()
@@ -1366,6 +1410,43 @@ class MainEnterpriseApp(QMainWindow):
         l_e.addRow(self.btn_save_exp)
         self.t_exp.setLayout(l_e)
         self.sub_tabs.addTab(self.t_exp, "")
+
+        # ---------------- Supplier Payments ----------------
+        self.t_supplier_pay = QWidget()
+        l_sp = QFormLayout()
+        self.pay_supplier = QComboBox()
+        btn_sp = QPushButton("+")
+        btn_sp.setFixedWidth(30)
+        btn_sp.clicked.connect(lambda: self.open_entity_manager('SUPPLIER'))
+        h_sp = QHBoxLayout()
+        h_sp.addWidget(self.pay_supplier)
+        h_sp.addWidget(btn_sp)
+
+        self.supplier_pay_amt = QLineEdit()
+        self.supplier_pay_curr = QComboBox()
+        self.supplier_pay_curr.addItems(["EGP", "USD", "RMB", "EUR"])
+        self.supplier_pay_fx = QLineEdit("1.0")
+        h_sp_amt = QHBoxLayout()
+        h_sp_amt.addWidget(self.supplier_pay_amt)
+        h_sp_amt.addWidget(QLabel("Currency:"))
+        h_sp_amt.addWidget(self.supplier_pay_curr)
+        h_sp_amt.addWidget(QLabel("FX Rate:"))
+        h_sp_amt.addWidget(self.supplier_pay_fx)
+
+        self.supplier_pay_method = QComboBox()
+        self.supplier_pay_method.addItems(["Cash", "Bank Transfer (SWIFT)", "Bank Transfer", "Credit Card"])
+        self.supplier_pay_notes = QLineEdit()
+        self.btn_save_supplier_pay = QPushButton("Save Supplier Payment")
+        self.btn_save_supplier_pay.setStyleSheet("background-color:#6f42c1;color:white;font-weight:bold;")
+        self.btn_save_supplier_pay.clicked.connect(self.save_supplier_payment)
+
+        l_sp.addRow(QLabel("Supplier:"), h_sp)
+        l_sp.addRow(QLabel("Payment Amount:"), h_sp_amt)
+        l_sp.addRow(QLabel("Payment Method:"), self.supplier_pay_method)
+        l_sp.addRow(QLabel("Notes:"), self.supplier_pay_notes)
+        l_sp.addRow(self.btn_save_supplier_pay)
+        self.t_supplier_pay.setLayout(l_sp)
+        self.sub_tabs.addTab(self.t_supplier_pay, "Supplier Payments")
 
         l_pay.addWidget(self.sub_tabs)
         self.page_pay.setLayout(l_pay)
@@ -1645,6 +1726,54 @@ class MainEnterpriseApp(QMainWindow):
 
         self.editing_invoice_id = invoice_id
         self.pur_inv_num.setText(inv[1])
+        idx_c = self.pur_client.findData(inv[2])
+        if idx_c != -1: self.pur_client.setCurrentIndex(idx_c)
+        idx_s = self.pur_supplier.findData(inv[3])
+        if idx_s != -1: self.pur_supplier.setCurrentIndex(idx_s)
+        idx_curr = self.pur_curr.findText(inv[4] or "USD")
+        if idx_curr != -1: self.pur_curr.setCurrentIndex(idx_curr)
+        self.pur_fx_rate.setText(str(inv[5]))
+
+        c.execute("""SELECT item_code,item_ar,item_cn,cartons,pcs_per_carton,total_pcs,
+                            piece_price,total_price,cbm_per_carton,total_cbm,weight
+                     FROM invoice_items WHERE invoice_id=? ORDER BY id""",(invoice_id,))
+        items=c.fetchall()
+        conn.close()
+
+        self.pur_table.setRowCount(0)
+        for r_idx,itm in enumerate(items[:15]):
+            self.pur_table.insertRow(r_idx)
+            for c_idx,val in enumerate(itm):
+                item=QTableWidgetItem(str(val if val is not None else ""))
+                if c_idx in [5,7,9]:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.pur_table.setItem(r_idx,c_idx,item)
+        while self.pur_table.rowCount() < 5:
+            self.pur_table.insertRow(self.pur_table.rowCount())
+        self.recalc_purchase_totals()
+
+        t=TRANSLATIONS[self.current_lang]
+        self.btn_save_pur.setText(t.get('update_inv_btn','Update Purchase Invoice'))
+        self.btn_save_pur.setStyleSheet("background-color:#ffc107;color:black;font-weight:bold;padding:7px;")
+        self.btn_cancel_pur_edit.setVisible(True)
+
+
+        conn = sqlite3.connect("import_enterprise.db")
+        c = conn.cursor()
+        c.execute("""SELECT id, invoice_num, client_id, supplier_id, currency, exchange_rate, total_amount, net_amount, total_cbm, fiscal_year
+                     FROM client_invoices WHERE id = ?""", (invoice_id,))
+        inv = c.fetchone()
+        if not inv:
+            conn.close()
+            return
+
+        if is_year_locked(inv[9]):
+            conn.close()
+            QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {inv[9]} is LOCKED! Cannot modify this invoice.")
+            return
+
+        self.editing_invoice_id = invoice_id
+        self.pur_inv_num.setText(inv[1])
 
         idx_c = self.pur_client.findData(inv[2])
         if idx_c != -1:
@@ -1682,6 +1811,24 @@ class MainEnterpriseApp(QMainWindow):
         self.btn_cancel_pur_edit.setVisible(True)
 
     def reset_purchase_form(self):
+        self.editing_invoice_id=None
+        self.pur_inv_num.clear()
+        self.pur_table.clearContents()
+        self.pur_table.setRowCount(5)
+        for r in range(self.pur_table.rowCount()):
+            for col in [5,7,9]:
+                item=QTableWidgetItem("")
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.pur_table.setItem(r,col,item)
+        self.pur_total.clear()
+        self.pur_net.clear()
+        self.pur_cbm.clear()
+        t=TRANSLATIONS[self.current_lang]
+        self.btn_save_pur.setText(t['save_inv_btn'])
+        self.btn_save_pur.setStyleSheet("background-color:#0d6efd;color:white;font-weight:bold;padding:7px;")
+        self.btn_cancel_pur_edit.setVisible(False)
+
+
         self.editing_invoice_id = None
         self.pur_inv_num.clear()
         self.pur_table.clearContents()
@@ -1696,6 +1843,32 @@ class MainEnterpriseApp(QMainWindow):
         self.btn_cancel_pur_edit.setVisible(False)
 
     def delete_invoice(self, invoice_id, invoice_num):
+        conn=sqlite3.connect("import_enterprise.db")
+        c=conn.cursor()
+        c.execute("SELECT fiscal_year FROM client_invoices WHERE id=?",(invoice_id,))
+        row=c.fetchone()
+        if row and is_year_locked(row[0]):
+            conn.close()
+            QMessageBox.critical(self,"Fiscal Lock",f"Fiscal Year {row[0]} is LOCKED! Cannot delete invoice.")
+            return
+        reply=QMessageBox.question(self,"Confirm Delete",f"Are you sure you want to delete invoice '{invoice_num}'?",QMessageBox.Yes|QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            conn.close(); return
+        c.execute("SELECT COUNT(*) FROM invoice_items WHERE invoice_id=? AND COALESCE(shipped_status,0)=1",(invoice_id,))
+        if c.fetchone()[0] > 0:
+            conn.close()
+            QMessageBox.warning(self,"Cannot Delete","This invoice has already-shipped cargo and cannot be deleted.")
+            return
+        c.execute("DELETE FROM supplier_ledger WHERE invoice_id=?",(invoice_id,))
+        c.execute("DELETE FROM invoice_items WHERE invoice_id=?",(invoice_id,))
+        c.execute("DELETE FROM client_invoices WHERE id=?",(invoice_id,))
+        conn.commit(); conn.close()
+        record_log(self.username,"DELETE_INVOICE",f"Deleted invoice '{invoice_num}' (ID: {invoice_id})")
+        QMessageBox.information(self,"Deleted",f"Invoice '{invoice_num}' deleted successfully.")
+        if self.editing_invoice_id==invoice_id: self.reset_purchase_form()
+        self.load_registered_invoices()
+
+
         conn = sqlite3.connect("import_enterprise.db")
         c = conn.cursor()
         c.execute("SELECT fiscal_year FROM client_invoices WHERE id = ?", (invoice_id,))
@@ -1720,6 +1893,116 @@ class MainEnterpriseApp(QMainWindow):
             conn.close()
 
     def save_purchase_invoice(self):
+        if is_year_locked(self.current_year):
+            QMessageBox.critical(self,"Fiscal Lock",f"Fiscal Year {self.current_year} is LOCKED! Cannot insert or modify records.")
+            return
+        num=self.pur_inv_num.text().strip()
+        c_id=self.pur_client.currentData()
+        s_id=self.pur_supplier.currentData()
+        curr=self.pur_curr.currentText()
+        try:
+            fx=float(self.pur_fx_rate.text().replace(",","").strip() or 1)
+        except ValueError:
+            QMessageBox.warning(self,"Warning","Invalid exchange rate."); return
+        if not num or not c_id or not s_id:
+            QMessageBox.warning(self,"Warning","Invoice Number, Client and Supplier are required.")
+            return
+
+        rows=[]
+        total=0.0
+        total_cbm=0.0
+        for row in range(self.pur_table.rowCount()):
+            code=self.pur_table.item(row,0)
+            ar=self.pur_table.item(row,1)
+            cn=self.pur_table.item(row,2)
+            if not ar or not ar.text().strip():
+                continue
+            def numv(col, default=0):
+                try:
+                    return float(self.pur_table.item(row,col).text().replace(",","").strip() or default)
+                except Exception:
+                    return float(default)
+            cartons=int(numv(3))
+            ppc=max(1,int(numv(4,1)))
+            total_pcs=int(numv(5,cartons*ppc))
+            price=numv(6)
+            total_price=total_pcs*price
+            cbm_carton=numv(8)
+            total_cbm=cartons*cbm_carton
+            weight=numv(10)
+            rows.append((code.text().strip() if code else "",ar.text().strip(),cn.text().strip() if cn else "",
+                         cartons,ppc,total_pcs,price,total_price,cbm_carton,total_cbm,weight))
+            total += total_price
+            total_cbm_sum = locals().get("total_cbm_sum",0.0) + total_cbm
+            locals()["total_cbm_sum"]=total_cbm_sum
+
+        total_cbm=locals().get("total_cbm_sum",0.0)
+        if not rows:
+            QMessageBox.warning(self,"Warning","Add at least one purchase item.")
+            return
+
+        if len(rows)>15:
+            QMessageBox.warning(self,"Maximum Items","Maximum 15 items per purchase invoice. Save this invoice and start a new invoice.")
+            return
+
+        tot_local=total*fx
+        net=tot_local
+
+        conn=sqlite3.connect("import_enterprise.db")
+        try:
+            c=conn.cursor()
+            # Duplicate supplier invoice number is checked per supplier.
+            c.execute("""SELECT id FROM client_invoices
+                         WHERE supplier_id=? AND invoice_num=? AND id<>COALESCE(?,0)""",
+                      (s_id,num,self.editing_invoice_id))
+            if c.fetchone():
+                raise ValueError("DUPLICATE_SUPPLIER_INVOICE")
+
+            if self.editing_invoice_id:
+                target=self.editing_invoice_id
+                c.execute("""UPDATE client_invoices SET invoice_num=?,client_id=?,supplier_id=?,
+                             currency=?,exchange_rate=?,total_amount=?,total_amount_local=?,net_amount=?,total_cbm=?
+                             WHERE id=?""",(num,c_id,s_id,curr,fx,total,tot_local,net,total_cbm,target))
+                c.execute("DELETE FROM invoice_items WHERE invoice_id=? AND COALESCE(shipped_status,0)=0",(target,))
+                c.execute("DELETE FROM supplier_ledger WHERE invoice_id=? AND tx_type='INVOICE'",(target,))
+                msg="Invoice updated successfully."
+            else:
+                c.execute("""INSERT INTO client_invoices
+                             (invoice_num,client_id,supplier_id,currency,exchange_rate,total_amount,total_amount_local,net_amount,total_cbm,fiscal_year)
+                             VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                          (num,c_id,s_id,curr,fx,total,tot_local,net,total_cbm,self.current_year))
+                target=c.lastrowid
+                msg="Invoice registered successfully."
+
+            for row in rows:
+                c.execute("""INSERT INTO invoice_items
+                    (invoice_id,item_code,item_ar,item_cn,cartons,pcs_per_carton,total_pcs,piece_price,total_price,
+                     cbm_per_carton,total_cbm,cbm,weight,shipped_status)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",(target,*row[:9],row[9],row[9],row[10]))
+
+            c.execute("""INSERT INTO supplier_ledger
+                (supplier_id,invoice_id,tx_type,amount,amount_local,currency,exchange_rate,supplier_invoice_num,reason,tx_date,method,created_by)
+                VALUES (?,?, 'INVOICE',?,?,?,?,?,?,?, ?,?)""",
+                (s_id,target,total,tot_local,curr,fx,num,f"Supplier Invoice #{num}",datetime.now().strftime("%Y-%m-%d"),"INVOICE",self.username))
+
+            conn.commit()
+            record_log(self.username,"SAVE_INVOICE",f"Saved supplier invoice #{num}: {total:,.2f} {curr}")
+            QMessageBox.information(self,"Success",msg)
+            self.reset_purchase_form()
+            self.load_registered_invoices()
+        except ValueError as e:
+            conn.rollback()
+            if str(e)=="DUPLICATE_SUPPLIER_INVOICE":
+                QMessageBox.warning(self,"Duplicate Supplier Invoice",f"Supplier invoice number '{num}' already exists for this supplier.")
+            else:
+                QMessageBox.warning(self,"Validation Error",str(e))
+        except sqlite3.IntegrityError as e:
+            conn.rollback()
+            QMessageBox.warning(self,"Error",f"Could not save invoice: {e}")
+        finally:
+            conn.close()
+
+
         if is_year_locked(self.current_year):
             QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {self.current_year} is LOCKED! Cannot insert or modify records.")
             return
@@ -1818,7 +2101,50 @@ class MainEnterpriseApp(QMainWindow):
         except ValueError:
             pass
 
-    def on_pur_table_cell_changed(self, row, column):
+    def on_pur_table_cell_changed(self,row,column):
+        if self._is_calculating:
+            return
+        if column in [3,4,6,8]:
+            self.recalc_purchase_totals()
+
+    def recalc_purchase_totals(self):
+        if self._is_calculating: return
+        self._is_calculating=True
+        total=0.0
+        total_cbm=0.0
+        try:
+            fx=float(self.pur_fx_rate.text().replace(",","").strip() or 1)
+        except Exception:
+            fx=1.0
+        try:
+            for r in range(self.pur_table.rowCount()):
+                cartons=float((self.pur_table.item(r,3).text() if self.pur_table.item(r,3) else "0").replace(",","") or 0)
+                ppc=max(1,int(float((self.pur_table.item(r,4).text() if self.pur_table.item(r,4) else "1") or 1)))
+                price=float((self.pur_table.item(r,6).text() if self.pur_table.item(r,6) else "0").replace(",","") or 0)
+                cbm_carton=float((self.pur_table.item(r,8).text() if self.pur_table.item(r,8) else "0").replace(",","") or 0)
+                total_pcs=int(cartons*ppc)
+                row_total=total_pcs*price
+                row_cbm=cartons*cbm_carton
+                self._set_calc_cell(r,5,total_pcs)
+                self._set_calc_cell(r,7,row_total)
+                self._set_calc_cell(r,9,row_cbm)
+                total+=row_total
+                total_cbm+=row_cbm
+            self.pur_total.setText(f"{total:,.2f}")
+            self.pur_net.setText(f"{total*fx:,.2f}")
+            self.pur_cbm.setText(f"{total_cbm:,.2f}")
+        finally:
+            self._is_calculating=False
+
+    def _set_calc_cell(self,row,col,value):
+        item=self.pur_table.item(row,col)
+        if item is None:
+            item=QTableWidgetItem("")
+            self.pur_table.setItem(row,col,item)
+        item.setText(f"{value:,.2f}" if col in [7,9] else f"{int(value)}")
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+
+
         if self._is_calculating or column not in [3, 4, 5]:
             return
         self.recalc_purchase_totals()
@@ -1856,6 +2182,48 @@ class MainEnterpriseApp(QMainWindow):
         self._is_calculating = False
 
     def import_excel_to_table(self, table):
+        path,_=QFileDialog.getOpenFileName(self,"Select Packing List Excel","","Excel Files (*.xlsx *.xls)")
+        if not path: return
+        try:
+            wb=openpyxl.load_workbook(path,data_only=True)
+            ws=wb.active
+            table.setRowCount(0)
+            row_count=0
+            for r_idx,row in enumerate(ws.iter_rows(values_only=True)):
+                if r_idx==0 or not any(row): continue
+                if table==self.pur_table and row_count>=15:
+                    break
+                table.insertRow(row_count)
+                if table==self.pur_table:
+                    # New format: code, ar, cn, cartons, pcs/carton, total pcs, price, total price, cbm/carton, total cbm, weight
+                    vals=list(row)
+                    mapping=[0,1,2,3,4,None,6,None,8,None,10]
+                    for c_idx,src in enumerate(mapping):
+                        if src is not None and src<len(vals):
+                            self.pur_table.setItem(row_count,c_idx,QTableWidgetItem(str(vals[src]) if vals[src] is not None else ""))
+                    # Backward-compatible old 7-column import: code, ar, cn, cartons, price, total cbm, weight
+                    if len(vals)<=7:
+                        self.pur_table.setItem(row_count,4,QTableWidgetItem("1"))
+                        self.pur_table.setItem(row_count,6,QTableWidgetItem(str(vals[4] or "")))
+                        cartons=float(vals[3] or 0)
+                        old_cbm=float(vals[5] or 0)
+                        cbm_per_carton=(old_cbm/cartons) if cartons else 0
+                        self.pur_table.setItem(row_count,8,QTableWidgetItem(str(cbm_per_carton)))
+                    for col in [5,7,9]:
+                        item=self.pur_table.item(row_count,col) or QTableWidgetItem("")
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        self.pur_table.setItem(row_count,col,item)
+                else:
+                    for c_idx in range(min(len(row),table.columnCount())):
+                        table.setItem(row_count,c_idx,QTableWidgetItem(str(row[c_idx]) if row[c_idx] is not None else ""))
+                row_count+=1
+            if table==self.pur_table: self.recalc_purchase_totals()
+            record_log(self.username,"IMPORT_EXCEL",f"Imported {row_count} rows from '{os.path.basename(path)}'")
+            QMessageBox.information(self,"Success",f"Successfully imported {row_count} items from Excel.")
+        except Exception as e:
+            QMessageBox.warning(self,"Import Error",f"Failed to import Excel: {str(e)}")
+
+
         path, _ = QFileDialog.getOpenFileName(self, "Select Packing List Excel", "", "Excel Files (*.xlsx *.xls)")
         if not path:
             return
@@ -1886,13 +2254,13 @@ class MainEnterpriseApp(QMainWindow):
             QMessageBox.warning(self, "Import Error", f"Failed to import Excel: {str(e)}")
 
     def delete_table_row(self, table):
-        curr = table.currentRow()
-        if curr >= 0:
+        curr=table.currentRow()
+        if curr>=0:
             table.removeRow(curr)
-            if table == self.pur_table:
+            if table==self.pur_table:
                 self.recalc_purchase_totals()
         else:
-            QMessageBox.information(self, "Note", "Please select a row to delete.")
+            QMessageBox.information(self,"Note","Please select a row to delete.")
 
     def open_fiscal_lock_manager(self):
         dlg = FiscalLockDialog(self.username)
@@ -1949,6 +2317,7 @@ class MainEnterpriseApp(QMainWindow):
         if self.role == "admin":
             self.act_users.setText(t['users_btn'])
             self.act_logs.setText(t['logs_btn'])
+            self.act_supplier_accounts.setText("Supplier Accounts")
             self.lbl_fyear.setText(t['fiscal_year_lbl'])
             self.btn_filter_year.setText(t['filter_btn'])
             self.btn_export.setText(t['export_excel_btn'])
@@ -1990,6 +2359,7 @@ class MainEnterpriseApp(QMainWindow):
 
         self.sub_tabs.setTabText(0, t['subtab_client_pay'])
         self.sub_tabs.setTabText(1, t['subtab_expenses'])
+        self.sub_tabs.setTabText(2, "Supplier Payments")
         self.lbl_pay_client.setText(t['client'])
         self.lbl_pay_amt.setText(t['amount'])
         self.lbl_pay_meth.setText(t['pay_method'])
@@ -2054,7 +2424,7 @@ class MainEnterpriseApp(QMainWindow):
         dlg.exec_()
 
     def refresh_all_dropdowns(self):
-        for combo in [self.pur_client, self.ship_client, self.pay_client]:
+        for combo in [self.pur_client, self.ship_client, self.pay_client, self.pay_supplier]:
             combo.clear()
         self.pur_supplier.clear()
         self.ship_agent.clear()
@@ -2079,6 +2449,7 @@ class MainEnterpriseApp(QMainWindow):
         c.execute("SELECT id, name FROM entities WHERE entity_type = 'SUPPLIER'")
         for r in c.fetchall():
             self.pur_supplier.addItem(r[1], r[0])
+            self.pay_supplier.addItem(r[1], r[0])
 
         c.execute("SELECT id, name FROM entities WHERE entity_type = 'SHIPPING_AGENT'")
         for r in c.fetchall():
@@ -2100,8 +2471,195 @@ class MainEnterpriseApp(QMainWindow):
             shutil.copy(path, dest)
             target_line_edit.setText(dest)
 
+
+    def add_purchase_row(self):
+        if self.pur_table.rowCount() >= 15:
+            QMessageBox.warning(
+                self, "Maximum Items",
+                "Maximum 15 items per purchase invoice. Save this invoice and start a new invoice."
+            )
+            return
+        row = self.pur_table.rowCount()
+        self.pur_table.insertRow(row)
+        for col in [5,7,9]:
+            item = QTableWidgetItem("")
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.pur_table.setItem(row,col,item)
+
+    def open_cargo_picker(self):
+        client_id = self.ship_client.currentData()
+        if not client_id:
+            QMessageBox.warning(self, "Warning", "Please select a client first.")
+            return
+        dlg = ContainerCargoPickerDialog(client_id, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self.ship_items_table.setRowCount(0)
+        for itm in dlg.selected_items:
+            row = self.ship_items_table.rowCount()
+            self.ship_items_table.insertRow(row)
+            vals = [
+                itm["invoice_num"], itm["code"], itm["name_ar"], itm["name_cn"],
+                itm["cartons"], itm["pcs_per_carton"], itm["total_pcs"],
+                "", itm["cbm"], itm["weight"]
+            ]
+            # fetch piece price from source invoice item
+            conn = sqlite3.connect("import_enterprise.db")
+            price_row = conn.execute("SELECT piece_price FROM invoice_items WHERE id=?", (itm["invoice_item_id"],)).fetchone()
+            conn.close()
+            vals[7] = price_row[0] if price_row else 0
+            for col,val in enumerate(vals):
+                item = QTableWidgetItem(str(val))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if col == 0:
+                    item.setData(Qt.UserRole, itm["invoice_item_id"])
+                self.ship_items_table.setItem(row,col,item)
+        self.ship_items_table.resizeRowsToContents()
+
+    def open_supplier_account(self):
+        if self.role != "admin":
+            return
+        SupplierAccountDialog(self).exec_()
+
+    def save_supplier_payment(self):
+        if is_year_locked(self.current_year):
+            QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {self.current_year} is LOCKED!")
+            return
+        sid = self.pay_supplier.currentData()
+        amt = float(self.supplier_pay_amt.text().replace(",","").strip() or 0)
+        curr = self.supplier_pay_curr.currentText()
+        fx = float(self.supplier_pay_fx.text().replace(",","").strip() or 1.0)
+        amt_local = amt * fx
+        method = self.supplier_pay_method.currentText()
+        reason = self.supplier_pay_notes.text().strip() or "Supplier Payment"
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if not sid or amt <= 0:
+            QMessageBox.warning(self, "Warning", "Select Supplier and enter a valid payment amount.")
+            return
+        conn = sqlite3.connect("import_enterprise.db")
+        conn.execute("""INSERT INTO supplier_ledger
+            (supplier_id, invoice_id, tx_type, amount, amount_local, currency, exchange_rate,
+             supplier_invoice_num, reason, tx_date, method, created_by)
+            VALUES (?, NULL, 'PAYMENT', ?, ?, ?, ?, NULL, ?, ?, ?, ?)""",
+            (sid, amt, amt_local, curr, fx, reason, today_str, method, self.username))
+        conn.commit()
+        conn.close()
+        record_log(self.username, "SUPPLIER_PAYMENT", f"Paid supplier '{self.pay_supplier.currentText()}': {amt:,.2f} {curr} ({amt_local:,.2f} EGP)")
+        self.supplier_pay_amt.clear()
+        self.supplier_pay_notes.clear()
+        QMessageBox.information(self, "Success", "Supplier payment saved successfully.")
+
+
     # ---------------- حفظ وتوزيع مصاريف الحاوية ----------------
     def save_container_data(self):
+        if is_year_locked(self.current_year):
+            QMessageBox.critical(self,"Fiscal Lock",f"Fiscal Year {self.current_year} is LOCKED! Cannot record container.")
+            return
+        c_num=self.ship_cnt_num.text().strip()
+        client_id=self.ship_client.currentData()
+        agent_id=self.ship_agent.currentData()
+        line=self.ship_line.text().strip()
+        bol=self.ship_bol.text().strip()
+        freight_raw=self.ship_freight_curr.currentText()
+        freight_curr="USD" if "USD" in freight_raw else ("RMB" if "RMB" in freight_raw else ("EUR" if "EUR" in freight_raw else "EGP"))
+        try:
+            freight_amt=float(self.ship_freight.text().replace(",","").strip() or 0)
+            freight_fx=float(self.ship_freight_fx.text().replace(",","").strip() or 1)
+            customs=float(self.ship_customs.text().replace(",","").strip() or 0)
+            comm=float(self.ship_comm.text().replace(",","").strip() or 0)
+        except ValueError:
+            QMessageBox.warning(self,"Warning","Invalid freight/customs/commission amount.")
+            return
+        total_cost=freight_amt*freight_fx+customs+comm
+        status=self.ship_status.currentText()
+        today=datetime.now().strftime("%Y-%m-%d")
+        if not c_num or not client_id:
+            QMessageBox.warning(self,"Warning","Please specify Container No and Client!")
+            return
+        if self.ship_items_table.rowCount()==0:
+            QMessageBox.warning(self,"Warning","Pull at least one unshipped invoice item into the container.")
+            return
+
+        payload=[]
+        total_cbm=0.0
+        for r in range(self.ship_items_table.rowCount()):
+            iid=self.ship_items_table.item(r,0).data(Qt.UserRole) if self.ship_items_table.item(r,0) else None
+            if not iid:
+                QMessageBox.warning(self,"Warning","Invalid cargo row. Use Pull Unshipped Invoices.")
+                return
+            def txt(col):
+                return self.ship_items_table.item(r,col).text().strip() if self.ship_items_table.item(r,col) else ""
+            cartons=int(float(txt(4) or 0))
+            ppc=max(1,int(float(txt(5) or 1)))
+            total_pcs=int(float(txt(6) or cartons*ppc))
+            price=float(txt(7).replace(",","") or 0)
+            cbm=float(txt(8).replace(",","") or 0)
+            weight=float(txt(9).replace(",","") or 0)
+            payload.append((iid,txt(0),txt(1),txt(2),txt(3),cartons,ppc,total_pcs,price,total_pcs*price,cbm,weight))
+            total_cbm+=cbm
+
+        conn=sqlite3.connect("import_enterprise.db")
+        try:
+            cur=conn.cursor()
+            for iid,*_ in payload:
+                check=cur.execute("""SELECT client_invoices.client_id,COALESCE(invoice_items.shipped_status,0)
+                                     FROM invoice_items JOIN client_invoices ON invoice_items.invoice_id=client_invoices.id
+                                     WHERE invoice_items.id=?""",(iid,)).fetchone()
+                if not check or check[0]!=client_id or check[1]:
+                    raise ValueError("One or more selected invoice items are no longer available for shipment.")
+
+            cur.execute("""INSERT INTO containers
+                (container_num,client_id,agent_id,shipping_line,bill_of_lading,freight_currency,sea_freight,
+                 freight_exchange_rate,customs_cost,commission,total_container_cost,status,arrival_date,currency,exchange_rate,fiscal_year)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'EGP',1.0,?)""",
+                (c_num,client_id,agent_id,line,bol,freight_curr,freight_amt,freight_fx,customs,comm,total_cost,status,today,self.current_year))
+            container_id=cur.lastrowid
+
+            for iid,inv_num,code,ar,cn,cartons,ppc,total_pcs,price,total_price,cbm,weight in payload:
+                allocated=(cbm/total_cbm)*total_cost if total_cbm>0 and cbm>0 else 0.0
+                landed=price+(allocated/total_pcs if total_pcs>0 else 0)
+                cur.execute("""INSERT INTO container_items
+                    (container_id,invoice_item_id,source_invoice_num,item_code,item_ar,item_cn,cartons,pcs_per_carton,total_pcs,
+                     piece_price,total_price,cbm,total_cbm,weight,allocated_expense,landed_cost_unit)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (container_id,iid,inv_num,code,ar,cn,cartons,ppc,total_pcs,price,total_price,cbm,cbm,weight,allocated,landed))
+                cur.execute("UPDATE invoice_items SET shipped_status=1 WHERE id=?",(iid,))
+
+            cur.execute("""INSERT INTO ledger
+                (tx_category,entity_id,container_id,currency,exchange_rate,amount,amount_local,tx_date,notes,fiscal_year,created_by)
+                VALUES ('EXPENSE',?,?,?,?,?,?,?,?,?,?)""",
+                (client_id,container_id,"EGP",1.0,total_cost,total_cost,today,
+                 f"Container Cost: {c_num} ({status}) [Freight: {freight_amt}{freight_curr}, Customs: {customs:,.2f} EGP]",
+                 self.current_year,self.username))
+
+            if "Cleared" in status or "الإفراج" in status:
+                cur.execute("UPDATE containers SET stocked_status=1 WHERE id=?",(container_id,))
+                cur.execute("""INSERT INTO ledger
+                    (tx_category,entity_id,container_id,currency,exchange_rate,amount,amount_local,tx_date,notes,fiscal_year,created_by)
+                    VALUES ('WAREHOUSE_STOCK',?,?,?,?,?,?,?,?,?,?)""",
+                    (client_id,container_id,"EGP",1.0,0,0,today,
+                     f"Stock Transfer: Cargo for Container {c_num} Cleared & Stored",self.current_year,self.username))
+            conn.commit()
+            record_log(self.username,"SAVE_CONTAINER",f"Registered container '{c_num}' (Total: {total_cost:,.2f} EGP; {len(payload)} pulled invoice items)")
+            QMessageBox.information(self,"Success",f"Container registered successfully.\nTotal Cost: {total_cost:,.2f} EGP allocated to cargo.")
+            self.ship_cnt_num.clear()
+            self.ship_items_table.setRowCount(0)
+            self.ship_freight.setText("0.0")
+            self.ship_customs.setText("0.0")
+            self.ship_comm.setText("0.0")
+            self.ship_total_egp.setText("0.00 EGP")
+            self.refresh_all_dropdowns()
+            self.populate_fiscal_years()
+        except ValueError as e:
+            conn.rollback()
+            QMessageBox.warning(self,"Cargo Validation",str(e))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            QMessageBox.warning(self,"Error","Container No already exists!")
+        finally:
+            conn.close()
+
+
         if is_year_locked(self.current_year):
             QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {self.current_year} is LOCKED! Cannot record container.")
             return
@@ -2417,7 +2975,8 @@ class MainEnterpriseApp(QMainWindow):
                 self.table_client_pays.setItem(idx, 4, QTableWidgetItem("No Attachment"))
 
         c.execute("""
-        SELECT c.container_num, ci.item_code, ci.item_ar, ci.cartons, ci.cbm, ci.weight, ci.allocated_expense, ci.landed_cost_unit
+        SELECT c.container_num, ci.item_code, ci.item_ar, ci.cartons,
+               COALESCE(ci.total_cbm,ci.cbm,0), ci.weight, ci.allocated_expense, ci.landed_cost_unit
         FROM container_items ci
         JOIN containers c ON ci.container_id = c.id
         WHERE c.client_id = ?
@@ -2682,7 +3241,8 @@ class MainEnterpriseApp(QMainWindow):
         pays = c.fetchall()
 
         c.execute("""
-        SELECT c.container_num, ci.item_code, ci.item_ar, ci.cartons, ci.cbm, ci.weight, ci.allocated_expense, ci.landed_cost_unit
+        SELECT c.container_num, ci.item_code, ci.item_ar, ci.cartons,
+               COALESCE(ci.total_cbm,ci.cbm,0), ci.weight, ci.allocated_expense, ci.landed_cost_unit
         FROM container_items ci
         JOIN containers c ON ci.container_id = c.id
         WHERE c.client_id = ? ORDER BY ci.id DESC
@@ -2795,6 +3355,259 @@ class MainEnterpriseApp(QMainWindow):
         wb.save(path)
         record_log(self.username, "EXPORT_EXCEL", f"Exported Client Dossier: {client_name}")
         QMessageBox.information(self, "Export Complete", f"Client dossier with embedded images exported to:\n{path}")
+
+# -------------------------------------------------------------
+# Dialogs for cargo selection and supplier accounts
+# -------------------------------------------------------------
+
+class ContainerCargoPickerDialog(QDialog):
+    """Pick unshipped invoice items for a container."""
+    def __init__(self, client_id, parent=None):
+        super().__init__(parent)
+        self.client_id = client_id
+        self.selected_items = []
+        self.setWindowTitle("📥 Pull Unshipped Invoices / اختيار بضاعة غير مشحونة")
+        self.resize(1200, 620)
+
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Select invoice / اختر الفاتورة:"))
+        self.invoice_filter = QComboBox()
+        self.invoice_filter.addItem("All Invoices", None)
+        top.addWidget(self.invoice_filter)
+        self.btn_invoice = QPushButton("☑ Select Invoice")
+        self.btn_invoice.clicked.connect(self.select_current_invoice)
+        top.addWidget(self.btn_invoice)
+        self.btn_all = QPushButton("☑ Select All")
+        self.btn_all.clicked.connect(self.select_all)
+        top.addWidget(self.btn_all)
+        self.btn_clear = QPushButton("☐ Clear")
+        self.btn_clear.clicked.connect(self.clear_all)
+        top.addWidget(self.btn_clear)
+        top.addStretch()
+        layout.addLayout(top)
+
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels([
+            "Select", "Invoice No", "Item Code", "Description (AR)", "Description (CN)",
+            "Cartons", "Pcs/Carton", "Total Pcs", "Total CBM", "Weight (KG)"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.cellChanged.connect(self.update_counter)
+        layout.addWidget(self.table)
+
+        self.lbl_cbm = QLabel("Selected CBM: 0.00 / 70.00 CBM")
+        self.lbl_cbm.setStyleSheet("font-weight: bold; padding: 6px;")
+        layout.addWidget(self.lbl_cbm)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        ok = QPushButton("Pull Selected Cargo")
+        ok.setStyleSheet("background-color:#0d6efd;color:white;font-weight:bold;padding:7px;")
+        ok.clicked.connect(self.confirm_selection)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+
+        self._loading = False
+        self.load_items()
+
+    def load_items(self):
+        conn = sqlite3.connect("import_enterprise.db")
+        c = conn.cursor()
+        c.execute("""
+            SELECT ii.id, i.invoice_num, ii.item_code, ii.item_ar, ii.item_cn,
+                   ii.cartons, COALESCE(ii.pcs_per_carton,1),
+                   COALESCE(ii.total_pcs, ii.cartons*COALESCE(ii.pcs_per_carton,1)),
+                   COALESCE(ii.total_cbm, ii.cbm, 0), ii.weight, i.id
+            FROM invoice_items ii
+            JOIN client_invoices i ON ii.invoice_id=i.id
+            WHERE i.client_id=? AND COALESCE(ii.shipped_status,0)=0
+            ORDER BY i.id DESC, ii.id
+        """, (self.client_id,))
+        rows = c.fetchall()
+        conn.close()
+
+        self._loading = True
+        self.table.setRowCount(0)
+        self.invoice_filter.blockSignals(True)
+        self.invoice_filter.clear()
+        self.invoice_filter.addItem("All Invoices", None)
+        seen = set()
+        for row in rows:
+            inv_id = row[10]
+            if inv_id not in seen:
+                self.invoice_filter.addItem(row[1], inv_id)
+                seen.add(inv_id)
+
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            chk = QTableWidgetItem()
+            chk.setCheckState(Qt.Unchecked)
+            chk.setData(Qt.UserRole, row[0])
+            self.table.setItem(r,0,chk)
+            values = [row[1],row[2],row[3],row[4],row[5],row[6],row[7],row[8],row[9]]
+            for col,val in enumerate(values,1):
+                item = QTableWidgetItem(str(val if val is not None else ""))
+                item.setData(Qt.UserRole, row[0])
+                self.table.setItem(r,col,item)
+        self.invoice_filter.blockSignals(False)
+        self._loading = False
+        self.update_counter()
+
+    def selected_rows(self):
+        ids = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r,0)
+            if item and item.checkState() == Qt.Checked:
+                ids.append(r)
+        return ids
+
+    def select_all(self):
+        self._loading = True
+        for r in range(self.table.rowCount()):
+            self.table.item(r,0).setCheckState(Qt.Checked)
+        self._loading = False
+        self.update_counter()
+
+    def clear_all(self):
+        self._loading = True
+        for r in range(self.table.rowCount()):
+            self.table.item(r,0).setCheckState(Qt.Unchecked)
+        self._loading = False
+        self.update_counter()
+
+    def select_current_invoice(self):
+        inv_id = self.invoice_filter.currentData()
+        if not inv_id:
+            self.select_all()
+            return
+        self._loading = True
+        for r in range(self.table.rowCount()):
+            item_id = self.table.item(r,0).data(Qt.UserRole)
+            # invoice id is kept in the visible invoice column user data
+            inv_text = self.table.item(r,1).text()
+            target = self.invoice_filter.currentText()
+            self.table.item(r,0).setCheckState(Qt.Checked if inv_text == target else Qt.Unchecked)
+        self._loading = False
+        self.update_counter()
+
+    def update_counter(self, *args):
+        if self._loading:
+            return
+        total = 0.0
+        for r in self.selected_rows():
+            try:
+                total += float(self.table.item(r,8).text().replace(",",""))
+            except Exception:
+                pass
+        self.lbl_cbm.setText(f"Selected CBM: {total:,.2f} / 70.00 CBM")
+        if total > 70:
+            self.lbl_cbm.setStyleSheet("font-weight:bold;padding:6px;color:#dc3545;")
+        else:
+            self.lbl_cbm.setStyleSheet("font-weight:bold;padding:6px;color:#198754;")
+
+    def confirm_selection(self):
+        rows = self.selected_rows()
+        if not rows:
+            QMessageBox.warning(self, "Warning", "Please select at least one invoice item.")
+            return
+        total = 0.0
+        selected = []
+        for r in rows:
+            try:
+                total += float(self.table.item(r,8).text().replace(",",""))
+            except Exception:
+                pass
+            selected.append({
+                "invoice_item_id": self.table.item(r,0).data(Qt.UserRole),
+                "invoice_num": self.table.item(r,1).text(),
+                "code": self.table.item(r,2).text(),
+                "name_ar": self.table.item(r,3).text(),
+                "name_cn": self.table.item(r,4).text(),
+                "cartons": int(float(self.table.item(r,5).text() or 0)),
+                "pcs_per_carton": int(float(self.table.item(r,6).text() or 1)),
+                "total_pcs": int(float(self.table.item(r,7).text() or 0)),
+                "cbm": float(self.table.item(r,8).text() or 0),
+                "weight": float(self.table.item(r,9).text() or 0)
+            })
+        if total > 70:
+            reply = QMessageBox.warning(
+                self, "Container Capacity Warning",
+                f"Selected cargo is {total:,.2f} CBM, above the standard 70 CBM capacity. Continue?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+        self.selected_items = selected
+        self.accept()
+
+
+class SupplierAccountDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Supplier Account / حساب المورد")
+        self.resize(650, 430)
+        layout = QVBoxLayout(self)
+        form = QHBoxLayout()
+        form.addWidget(QLabel("Supplier:"))
+        self.combo = QComboBox()
+        form.addWidget(self.combo)
+        layout.addLayout(form)
+
+        self.lbl_invoices = QLabel("Total Invoices: 0.00 EGP")
+        self.lbl_paid = QLabel("Total Paid: 0.00 EGP")
+        self.lbl_balance = QLabel("Remaining Balance: 0.00 EGP")
+        for w in [self.lbl_invoices,self.lbl_paid,self.lbl_balance]:
+            w.setStyleSheet("font-size:15px;font-weight:bold;padding:8px;")
+            layout.addWidget(w)
+
+        self.table = QTableWidget(0,6)
+        self.table.setHorizontalHeaderLabels(["Date","Type","Amount","Local (EGP)","Invoice","Reason"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.table)
+        self.combo.currentIndexChanged.connect(self.load_account)
+        self.load_suppliers()
+
+    def load_suppliers(self):
+        conn=sqlite3.connect("import_enterprise.db")
+        rows=conn.execute("SELECT id,name FROM entities WHERE entity_type='SUPPLIER' ORDER BY name").fetchall()
+        conn.close()
+        self.combo.clear()
+        for r in rows:
+            self.combo.addItem(r[1],r[0])
+        self.load_account()
+
+    def load_account(self):
+        sid=self.combo.currentData()
+        if not sid:
+            self.lbl_invoices.setText("Total Invoices: 0.00 EGP")
+            self.lbl_paid.setText("Total Paid: 0.00 EGP")
+            self.lbl_balance.setText("Remaining Balance: 0.00 EGP")
+            self.table.setRowCount(0)
+            return
+        conn=sqlite3.connect("import_enterprise.db")
+        c=conn.cursor()
+        c.execute("""SELECT
+                     COALESCE(SUM(CASE WHEN tx_type='INVOICE' THEN amount_local ELSE 0 END),0),
+                     COALESCE(SUM(CASE WHEN tx_type='PAYMENT' THEN amount_local ELSE 0 END),0)
+                     FROM supplier_ledger WHERE supplier_id=?""",(sid,))
+        inv,paid=c.fetchone()
+        c.execute("""SELECT tx_date,tx_type,amount,amount_local,supplier_invoice_num,reason
+                     FROM supplier_ledger WHERE supplier_id=? ORDER BY id DESC""",(sid,))
+        rows=c.fetchall()
+        conn.close()
+        self.lbl_invoices.setText(f"Total Invoices: {inv:,.2f} EGP")
+        self.lbl_paid.setText(f"Total Paid: {paid:,.2f} EGP")
+        self.lbl_balance.setText(f"Remaining Balance: {inv-paid:,.2f} EGP")
+        self.table.setRowCount(0)
+        for r,row in enumerate(rows):
+            self.table.insertRow(r)
+            for col,val in enumerate(row):
+                self.table.setItem(r,col,QTableWidgetItem(str(val if val is not None else "")))
+
 
 # -------------------------------------------------------------
 # تشغيل التطبيق
