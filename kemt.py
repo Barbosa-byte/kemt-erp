@@ -434,11 +434,22 @@ def init_database():
     # an existing SQLite table, so add the column before creating the index.
     c.execute("PRAGMA table_info(supplier_ledger)")
     supplier_ledger_columns = {row[1] for row in c.fetchall()}
-    if "supplier_invoice_num" not in supplier_ledger_columns:
-        c.execute("""
-            ALTER TABLE supplier_ledger
-            ADD COLUMN supplier_invoice_num TEXT
-        """)
+
+    # Migration for older supplier_ledger tables. SQLite's
+    # CREATE TABLE IF NOT EXISTS does not modify an existing table.
+    supplier_ledger_migrations = {
+        "invoice_id": "INTEGER",
+        "currency": "TEXT DEFAULT 'EGP'",
+        "exchange_rate": "REAL DEFAULT 1.0",
+        "supplier_invoice_num": "TEXT",
+        "method": "TEXT",
+        "created_by": "TEXT",
+    }
+    for col_name, col_definition in supplier_ledger_migrations.items():
+        if col_name not in supplier_ledger_columns:
+            c.execute(
+                f"ALTER TABLE supplier_ledger ADD COLUMN {col_name} {col_definition}"
+            )
 
     c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_supplier_invoice_debt
                  ON supplier_ledger(supplier_id, supplier_invoice_num, tx_type)
