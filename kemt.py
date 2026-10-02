@@ -1724,6 +1724,16 @@ class MainEnterpriseApp(QMainWindow):
             QMessageBox.critical(self, "Fiscal Lock", f"Fiscal Year {inv[9]} is LOCKED! Cannot modify this invoice.")
             return
 
+        c.execute("SELECT COUNT(*) FROM invoice_items WHERE invoice_id=? AND COALESCE(shipped_status,0)=1", (invoice_id,))
+        if c.fetchone()[0] > 0:
+            conn.close()
+            QMessageBox.warning(
+                self, "Invoice Locked",
+                "This purchase invoice contains cargo that has already been shipped. "
+                "Create a new invoice for additional changes instead of editing the shipped invoice."
+            )
+            return
+
         self.editing_invoice_id = invoice_id
         self.pur_inv_num.setText(inv[1])
         idx_c = self.pur_client.findData(inv[2])
