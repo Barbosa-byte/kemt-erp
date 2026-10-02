@@ -1319,6 +1319,13 @@ class MainEnterpriseApp(QMainWindow):
         self.ship_items_table.setEditTriggers(QTableWidget.NoEditTriggers)
         l_ship.addWidget(self.ship_items_table)
 
+        # Live CBM counter for all cargo currently added to this container.
+        self.lbl_ship_total_cbm = QLabel("Total Container CBM: 0.00 CBM")
+        self.lbl_ship_total_cbm.setStyleSheet(
+            "font-size: 15px; font-weight: bold; padding: 8px;"
+        )
+        l_ship.addWidget(self.lbl_ship_total_cbm)
+
         self.btn_save_ship = QPushButton()
         self.btn_save_ship.setStyleSheet("background-color: #0d6efd; color: white; font-weight: bold; padding: 7px;")
         self.btn_save_ship.clicked.connect(self.save_container_data)
@@ -2270,6 +2277,7 @@ class MainEnterpriseApp(QMainWindow):
                     item.setData(Qt.UserRole, itm["invoice_item_id"])
                 self.ship_items_table.setItem(row,col,item)
         self.ship_items_table.resizeRowsToContents()
+        self.update_shipping_cbm_counter()
 
     def open_supplier_account(self):
         if self.role != "admin":
@@ -2337,6 +2345,29 @@ class MainEnterpriseApp(QMainWindow):
             self.ship_cnt_num.setText(container_num)
         finally:
             conn.close()
+
+    def update_shipping_cbm_counter(self):
+        """Update the visible CBM total for cargo currently added to the container."""
+        total_cbm = 0.0
+        for row in range(self.ship_items_table.rowCount()):
+            try:
+                value = self.ship_items_table.item(row, 8)
+                if value:
+                    total_cbm += float(value.text().replace(",", "").strip() or 0)
+            except (ValueError, TypeError):
+                pass
+
+        self.lbl_ship_total_cbm.setText(
+            f"Total Container CBM: {total_cbm:,.2f} CBM"
+        )
+        if total_cbm > 70:
+            self.lbl_ship_total_cbm.setStyleSheet(
+                "font-size: 15px; font-weight: bold; padding: 8px; color: #dc3545;"
+            )
+        else:
+            self.lbl_ship_total_cbm.setStyleSheet(
+                "font-size: 15px; font-weight: bold; padding: 8px; color: #198754;"
+            )
 
     def save_container_data(self):
         if is_year_locked(self.current_year):
@@ -2431,6 +2462,7 @@ class MainEnterpriseApp(QMainWindow):
             QMessageBox.information(self,"Success",f"Container registered successfully.\nTotal Cost: {total_cost:,.2f} EGP allocated to cargo.")
             self.ship_cnt_num.clear()
             self.ship_items_table.setRowCount(0)
+            self.update_shipping_cbm_counter()
             self.ship_freight.setText("0.0")
             self.ship_customs.setText("0.0")
             self.ship_comm.setText("0.0")
