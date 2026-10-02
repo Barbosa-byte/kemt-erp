@@ -1194,6 +1194,9 @@ class MainEnterpriseApp(QMainWindow):
         self.stack.addWidget(self.page_pur)
 
         # ---------------- 2. شاشة الشحن ----------------
+        self.page_ship = QWidget()
+        l_ship = QVBoxLayout()
+
         self.box_ship = QGroupBox()
         f_ship = QFormLayout()
 
