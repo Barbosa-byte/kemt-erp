@@ -2186,7 +2186,6 @@ class MainEnterpriseApp(QMainWindow):
         self.pur_supplier.clear()
         self.ship_agent.clear()
         self.exp_container.clear()
-        self.combo_update_cnt.clear()
 
         if self.role == "admin":
             self.combo_rep_cnt.clear()
@@ -2215,7 +2214,6 @@ class MainEnterpriseApp(QMainWindow):
         c.execute("SELECT id, container_num FROM containers")
         for r in c.fetchall():
             self.exp_container.addItem(f"Container: {r[1]}", r[0])
-            self.combo_update_cnt.addItem(f"{r[1]}", r[0])
             if self.role == "admin":
                 self.combo_rep_cnt.addItem(f"{r[1]}", r[0])
 
